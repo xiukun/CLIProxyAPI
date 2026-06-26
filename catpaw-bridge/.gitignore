@@ -1,0 +1,21 @@
+# Runtime artifacts (contain SSO tokens, cookies, credentials)
+.logs/
+.pids/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Extracted keys (regenerated at runtime from extension.js)
+.rsa_key1.txt
+
+# CLIProxyAPI build artifact (run `go build` to regenerate)
+../cli-proxy-api
+
+# Management panel (copied from CLIProxyAPI build, not source)
+static/management.html
+
+# Local config overrides
+bridge.local.yaml
+.env.local

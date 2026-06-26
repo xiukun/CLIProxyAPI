@@ -1,0 +1,32 @@
+{
+  "profiles": {
+    "catpaw-glm52": {
+      "name": "CatPaw glm-5.2",
+      "anthropic": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
+        "ANTHROPIC_AUTH_TOKEN": "sk-catpaw-bridge-key",
+        "ANTHROPIC_MODEL": "glm-5.2",
+        "ANTHROPIC_SMALL_FAST_MODEL": "glm-5.2"
+      }
+    },
+    "catpaw-glm52-as-claude": {
+      "name": "CatPaw glm-5.2 (伪装 claude-sonnet-4-20250514)",
+      "anthropic": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
+        "ANTHROPIC_AUTH_TOKEN": "sk-catpaw-bridge-key",
+        "ANTHROPIC_MODEL": "claude-sonnet-4-20250514",
+        "ANTHROPIC_SMALL_FAST_MODEL": "claude-sonnet-4-20250514"
+      }
+    },
+    "official-claude": {
+      "name": "Claude 官方",
+      "anthropic": {
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "ANTHROPIC_AUTH_TOKEN": "sk-ant-your-official-key",
+        "ANTHROPIC_MODEL": "claude-sonnet-4-20250514",
+        "ANTHROPIC_SMALL_FAST_MODEL": "claude-3-5-haiku-20241022"
+      }
+    }
+  },
+  "_comment": "此文件由 bridge.conf.yaml 同步生成。修改配置请编辑 bridge.conf.yaml 后重新运行 generate-profiles.py"
+}

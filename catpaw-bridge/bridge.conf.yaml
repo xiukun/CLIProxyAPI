@@ -1,0 +1,48 @@
+# =============================================================================
+# CatPawAI Bridge - 统一配置文件
+# =============================================================================
+# 所有组件（反代、CLIProxyAPI、cc-switch）的配置集中在此文件。
+# 修改配置后重启服务即可生效: ./start.sh --stop && ./start.sh
+#
+# 配置优先级: 环境变量 > bridge.conf.yaml > 代码内默认值
+# =============================================================================
+
+# ---- 网络 ----
+cliproxy:
+  port: 8317                    # CLIProxyAPI 监听端口
+  api_key: "sk-catpaw-bridge-key"  # Claude Code 认证密钥（cc-switch 用同一个）
+
+catpaw_proxy:
+  port: 9000                    # CatPawAI 反向代理监听端口
+  verbose: true                 # 详细日志
+
+# ---- CatPawAI 上游 ----
+catpaw:
+  api_host: "catpaw.meituan.com"
+  data_dir: "~/Library/Application Support/CatPawAI"  # CatPawAI IDE 数据目录
+  sso_client_id: "1d47d6ff96"
+  sso_client_id_2: "f32a546874"
+  tenant_id: "5282fa6645"
+  need_passport_id: true        # tenant 5282fa6645 使用 passportid cookie
+
+# ---- 模型 ----
+model:
+  name: "glm-5.2"               # CatPawAI 上游模型名
+  type_code: 2                  # 1=快速, 2=精确
+  # 伪装别名: 让 Claude Code 能用 claude-sonnet-4-20250514 名称访问
+  aliases:
+    - "glm-5.2"
+    - "claude-sonnet-4-20250514"
+
+# ---- Claude Code 配置 (cc-switch 用) ----
+claude_code:
+  # 直接使用模型名
+  model: "glm-5.2"
+  small_model: "glm-5.2"
+  # 伪装模式（某些工具硬编码模型名时使用）
+  masked_model: "claude-sonnet-4-20250514"
+  masked_small_model: "claude-sonnet-4-20250514"
+  # 官方 API（切换回官方时用）
+  official_base_url: "https://api.anthropic.com"
+  official_model: "claude-sonnet-4-20250514"
+  official_small_model: "claude-3-5-haiku-20241022"
