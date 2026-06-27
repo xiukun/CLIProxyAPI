@@ -62,3 +62,12 @@ claude_code:
   official_base_url: "https://api.anthropic.com"
   official_model: "claude-sonnet-4-20250514"
   official_small_model: "claude-3-5-haiku-20241022"
+
+# ---- Codex CLI 配置 (codex-switch 用) ----
+codex:
+  model: "gpt-5.5"               # Codex CLI 默认模型 (别名，映射到 glm-5.2)
+  wire_api: "responses"             # Codex 强制要求 responses = /v1/responses
+                                 # CLIProxyAPI 翻译层已在 [DONE] 时正确发出 response.completed 事件
+                                 # 根级 /responses 路由也已就绪，Codex 可直接访问
+  official_model: "gpt-4.1"      # 切换回官方时的模型
+  official_base_url: "https://api.openai.com/v1"

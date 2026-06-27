@@ -34,6 +34,8 @@ glm-5.2 模型
 | `config.yaml` | CLIProxyAPI 配置，定义 catpaw 上游 Provider（从 bridge.conf.yaml 同步端口） |
 | `start.sh` | 一键启动/停止脚本 |
 | `cc-switch.sh` | Claude Code 配置切换脚本（从 bridge.conf.yaml 读取配置） |
+| `codex-config.toml` | Codex CLI 配置模板（手动复制到 ~/.codex/config.toml） |
+| `codex-switch.sh` | Codex CLI 配置切换脚本（自动生成 ~/.codex/config.toml） |
 | `cc-switch-profiles.json` | cc-switch 桌面应用导入配置（由 generate-profiles.py 从 YAML 生成） |
 | `generate-profiles.py` | 从 bridge.conf.yaml 生成 cc-switch-profiles.json 的工具 |
 
@@ -109,6 +111,33 @@ claude
    ```
 3. 导入配置文件 `catpaw-bridge/cc-switch-profiles.json`
 4. 在 cc-switch 界面中选择 "CatPaw GLM-5.2" 并切换
+
+### 4. 在 Codex CLI 中使用
+
+**前提：已安装 Codex CLI**
+```bash
+npm install -g @openai/codex
+```
+
+**方式 A：自动配置（推荐）**
+```bash
+source catpaw-bridge/codex-switch.sh
+codex_switch catpaw
+codex
+```
+
+**方式 B：手动复制配置**
+```bash
+cp catpaw-bridge/codex-config.toml ~/.codex/config.toml
+export OPENAI_API_KEY=sk-catpaw-bridge-key
+codex
+```
+
+**切换回 OpenAI 官方：**
+```bash
+source catpaw-bridge/codex-switch.sh
+codex_switch official
+```
 
 ### 4. 验证
 

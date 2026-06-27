@@ -1,0 +1,45 @@
+# =============================================================================
+# Codex CLI - CatPawAI Bridge 配置
+# =============================================================================
+# 将 Codex CLI 指向本地 CLIProxyAPI，通过 CatPawAI 反代使用 glm-5.2。
+#
+# 安装: cp此文件到 ~/.codex/config.toml
+# 或:   source catpaw-bridge/codex-switch.sh && codex_switch catpaw
+# =============================================================================
+
+# 模型供应商: 指向本地 CLIProxyAPI
+model_provider = "catpaw"
+
+# 默认模型: CatPawAI 的 glm-5.2
+model = "glm-5.2"
+model_reasoning_effort = "high"
+
+# 使用 Responses API (Codex 桌面版默认)
+# CLIProxyAPI 已在根级提供 /responses 端点
+wire_api = "responses"
+
+# 禁用响应存储 (CatPawAI 不支持服务端存储)
+disable_response_storage = true
+
+# 供应商配置
+# 注意: base_url 不带 /v1 后缀
+# Codex 桌面版会自动拼接 /responses，CLIProxyAPI 已在根级和 /v1/ 都注册了路由
+[model_providers.catpaw]
+name = "CatPawAI Bridge"
+base_url = "http://127.0.0.1:8317"
+wire_api = "responses"
+
+# API Key: 与 bridge.conf.yaml 中 cliproxy.api_key 一致
+api_key = "sk-catpaw-bridge-key"
+
+# =============================================================================
+# 备用配置: 使用 Chat Completions API (wire_api = "chat")
+# 如果 Responses API 遇到兼容性问题，切换到此配置
+# =============================================================================
+# model_provider = "catpaw-chat"
+# wire_api = "chat"
+# [model_providers.catpaw-chat]
+# name = "CatPawAI Bridge (Chat API)"
+# base_url = "http://127.0.0.1:8317"
+# wire_api = "chat"
+# api_key = "sk-catpaw-bridge-key"

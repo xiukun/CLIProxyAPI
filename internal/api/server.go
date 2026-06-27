@@ -465,6 +465,18 @@ func (s *Server) setupRoutes() {
 		codexDirect.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
 
+	// Root-level route aliases for Codex desktop app compatibility.
+	// The Codex desktop app (Codex.app) strips the path from base_url,
+	// hitting /responses instead of /v1/responses. These routes ensure
+	// both /responses and /chat/completions work at root level.
+	rootAliases := s.engine.Group("")
+	rootAliases.Use(AuthMiddleware(s.accessManager))
+	{
+		rootAliases.POST("/responses", openaiResponsesHandlers.Responses)
+		rootAliases.POST("/chat/completions", openaiHandlers.ChatCompletions)
+		rootAliases.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
+	}
+
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
 	v1beta.Use(AuthMiddleware(s.accessManager))

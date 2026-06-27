@@ -4,7 +4,7 @@ Key design decisions:
   - Claude Code sends 100KB+ of system prompt + tool definitions as messages.
     CatPawAI upstream rejects requests >~64KB encrypted. We DROP Claude Code's
     verbose messages and replace them with a compact custom system prompt.
-  - CatPawAI response format: {"lastOne":false,"content":"text","model":"glm-4.7"}
+  - CatPawAI response format: {"lastOne":false,"content":"text","model":"glm-5.2"}
     The `content` field is at the TOP LEVEL, not inside `choices[].delta`.
   - planPromptEnabled: false (avoids agent XML injection)
   - chatApplyModeType: "chat"
