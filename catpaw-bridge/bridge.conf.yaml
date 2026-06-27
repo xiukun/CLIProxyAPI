@@ -15,6 +15,22 @@ cliproxy:
 catpaw_proxy:
   port: 9000                    # CatPawAI 反向代理监听端口
   verbose: true                 # 详细日志
+  # 关闭工具定义自动注入（默认 false）
+  # true: 不将 tools 数组注入到 CatPawAI 请求中，大幅减小请求体
+  #       仍保留 tool 消息转换 + <tool_call> 响应解析
+  #       你可以在 system prompt 中手动描述需要的工具
+  strip_tool_definitions: false
+
+# ---- 请求体大小限制 ----
+limits:
+  # CatPawAI 上游对加密请求体有大小限制（约 128KB）
+  # 超过此值上游会直接关闭连接，不返回任何 HTTP 响应
+  max_encrypted_body: 180000    # 加密后最大字节数（警告阈值）
+  # 系统消息截断阈值（Claude Code 的 system prompt 含完整工具描述，
+  # 通常 80-120KB，我们已用紧凑格式注入工具定义，可安全截断）
+  max_system_content: 8000      # 系统消息最大字符数
+  # 普通消息截断阈值（如 Read 工具返回的大文件内容）
+  max_message_content: 15000    # 非系统消息最大字符数
 
 # ---- CatPawAI 上游 ----
 catpaw:

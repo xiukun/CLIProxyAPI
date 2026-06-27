@@ -1,21 +1,10 @@
-#!/usr/bin/env python3
 """
-CatPawAI Reverse Proxy (with encryption support)
+CatPawAI Reverse Proxy — 模块化拆分包.
 
 将 CatPawAI IDE 的 glm-5.2 模型暴露为标准 OpenAI 兼容 API，
 供 CLIProxyAPI 调用，最终让 Claude Code 使用。
 
-工作流程:
-    Claude Code -> CLIProxyAPI (:8317)
-        -> 本代理 (:9000, 注入 SSO 认证 + 加密)
-        -> CatPawAI API (catpaw.meituan.com/api/gpt/openai/stream)
-        -> glm-5.2
-
-认证信息自动从 CatPawAI 的 state.vscdb 中读取。
-请求体使用 AES-128-ECB + RSA-OAEP-SHA1 加密。
-
-------------------------------------------------------------------------
-模块结构 (proxy/ 包):
+模块结构:
     config      — 配置加载 (bridge.conf.yaml + 环境变量 + 默认值)
     utils       — 共享工具函数
     crypto      — RSA 密钥提取 + AES-128-ECB 加解密
@@ -30,14 +19,3 @@ CatPawAI Reverse Proxy (with encryption support)
 后续扩展 Codex 等新 provider 时，可新增 codex_*.py 模块或
 providers/ 子包，复用 config / sse / utils 等共享层。
 """
-
-import os
-import sys
-
-# Ensure the script directory is on sys.path so `proxy` package can be imported
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from proxy.app import main
-
-if __name__ == "__main__":
-    main()
