@@ -25,7 +25,7 @@ from proxy.toolcall import (
 )
 from proxy.utils import _extract_text_content
 from proxy.compactor import compact_messages, compact_merged_content
-from proxy.memory import get_summary_prefix, save_memory
+from proxy.memory import get_summary_prefix, save_memory, _conv_hash
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +201,7 @@ _CUSTOM_SYSTEM_PROMPT = (
 )
 
 
-def openai_to_catpaw_request(openai_body: dict) -> dict:
+async def openai_to_catpaw_request(openai_body: dict) -> dict:
     """Convert OpenAI chat completion request to CatPawAI agent-mode format."""
     messages = openai_body.get("messages", [])
     tools = openai_body.get("tools", [])
@@ -218,7 +218,7 @@ def openai_to_catpaw_request(openai_body: dict) -> dict:
             print(f"[CatPawProxy]     preview: {preview}", flush=True)
 
     # Get or create conversation session
-    conversation_id, is_new = get_or_create_conversation_id(messages)
+    conversation_id, is_new = await get_or_create_conversation_id(messages)
 
     # Build the merged content
     if len(messages) == 0:
@@ -245,6 +245,18 @@ def openai_to_catpaw_request(openai_body: dict) -> dict:
 
             # 3.5. Load external memory — if we have a summary of old turns,
             #      prepend it and drop the old messages it covers
+            #
+            # CRITICAL: Compute the memory hash and save a copy of filtered
+            # BEFORE any modification (memory drop, compaction). The hash
+            # must be consistent between save and load:
+            #   - save_memory uses exclude_last=False (all user messages)
+            #   - load_memory uses exclude_last=True (drops last user msg)
+            # Without pre-computing, compaction modifies user message content
+            # (Phase 2 summarizes to 200 chars), causing the hash to differ
+            # and the memory to never load on subsequent requests.
+            pre_modification_filtered = list(filtered)  # shallow copy (dicts not mutated later)
+            pre_compaction_hash = _conv_hash(filtered, conversation_id, exclude_last=False)
+
             memory_prefix = get_summary_prefix(filtered, conversation_id)
             if memory_prefix:
                 # Drop old messages that are covered by the summary
@@ -281,12 +293,14 @@ def openai_to_catpaw_request(openai_body: dict) -> dict:
                 merged_content = compact_merged_content(merged_content, MAX_ENCRYPTED_BODY)
 
             # 7. Save memory for future requests in this conversation
-            #    CRITICAL: use 'filtered' not 'messages' — the hash must match
-            #    what get_summary_prefix() uses for lookup. If we use the raw
-            #    'messages' list, system-reminder-only user messages that were
-            #    dropped during filtering will cause a hash mismatch and the
-            #    memory will never be loaded on subsequent requests.
-            save_memory(filtered, conversation_id)
+            #    CRITICAL: use pre_modification_filtered (before memory drop +
+            #    compaction) and pre_compaction_hash (computed before compaction
+            #    modified user message content). This ensures:
+            #    - The summary covers all messages (not just the 10 kept recent)
+            #    - The hash matches what load_memory will compute next request
+            #      (load uses exclude_last=True, which drops the new user msg,
+            #      giving the same hash as our exclude_last=False storage hash)
+            save_memory(pre_modification_filtered, conversation_id, conv_hash=pre_compaction_hash)
         else:
             # No tools: use simple text merging
             parts = []

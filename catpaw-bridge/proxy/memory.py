@@ -44,11 +44,18 @@ def _ensure_memory_dir():
     _MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _conv_hash(messages: list, conversation_id: str = "") -> str:
+def _conv_hash(messages: list, conversation_id: str = "", exclude_last: bool = False) -> str:
     """Generate a stable hash for the conversation.
 
     Uses BOTH user message content AND conversation_id to ensure
     different sessions with similar messages don't collide.
+
+    Two-phase strategy (same as session.py):
+    - exclude_last=True:  for LOOKUP ("have I seen this prefix before?")
+      Excludes the last user message so the hash matches the storage hash
+      from the previous request (which included all user messages at that time).
+    - exclude_last=False: for STORAGE ("remember this state for next time")
+      Includes all user messages so the next request can find it via lookup.
     """
     user_msgs = []
     for msg in messages:
@@ -56,6 +63,8 @@ def _conv_hash(messages: list, conversation_id: str = "") -> str:
             content = _extract_text_content(msg.get("content", ""))
             # Use first 200 chars for efficiency
             user_msgs.append(content[:200])
+    if exclude_last and user_msgs:
+        user_msgs = user_msgs[:-1]
     # Include conversation_id in hash to prevent cross-session collisions
     raw = f"{conversation_id}\n" + "\n".join(user_msgs)
     return hashlib.md5(raw.encode()).hexdigest()[:16]
@@ -79,7 +88,9 @@ def load_memory(messages: list, conversation_id: str = "") -> dict | None:
         return None
 
     _ensure_memory_dir()
-    ch = _conv_hash(messages, conversation_id)
+    # LOOKUP phase: exclude last user message so hash matches the storage
+    # hash from the previous request (which had one fewer user message).
+    ch = _conv_hash(messages, conversation_id, exclude_last=True)
     path = _memory_path(ch)
 
     if not path.exists():
@@ -99,19 +110,29 @@ def load_memory(messages: list, conversation_id: str = "") -> dict | None:
         return None
 
 
-def save_memory(messages: list, conversation_id: str) -> None:
+def save_memory(messages: list, conversation_id: str, conv_hash: str = "") -> None:
     """Save a summary of old conversation turns to disk.
 
     Only summarizes messages older than _KEEP_RECENT.
     The summary includes:
       - Role and first N chars of each old message
       - Tool call names (not arguments)
+
+    Args:
+        conv_hash: pre-computed hash. If provided, used instead of computing
+            _conv_hash(messages, ...). This is critical when the caller has
+            modified messages (e.g. compaction) after computing the hash —
+            the hash must match what load_memory will compute on the next
+            request (via exclude_last=True lookup).
     """
     if len(messages) < _SUMMARY_THRESHOLD:
         return
 
     _ensure_memory_dir()
-    ch = _conv_hash(messages, conversation_id)
+    # STORAGE phase: include all user messages (exclude_last=False).
+    # If a pre-computed hash is provided (from before compaction), use it
+    # to ensure consistency with load_memory's lookup hash.
+    ch = conv_hash if conv_hash else _conv_hash(messages, conversation_id, exclude_last=False)
     path = _memory_path(ch)
 
     # Summarize messages before the recent ones

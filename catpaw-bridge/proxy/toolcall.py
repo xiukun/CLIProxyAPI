@@ -465,6 +465,26 @@ def _parse_func_call_syntax(text: str) -> dict | None:
     }
 
 
+def _extract_kv_pairs(text: str) -> dict:
+    """Extract "key":"value" pairs from text as a fallback JSON parser.
+
+    Used by _parse_name_json_syntax, _parse_truncated_json_syntax, and
+    _parse_comma_json_syntax when json.loads fails on the extracted fragment.
+    Handles quoted strings (via json.loads) and unquoted values (as-is).
+    """
+    args = {}
+    for kv_match in re.finditer(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|[^,}]+)', text):
+        pname = kv_match.group(1)
+        pval = kv_match.group(2).strip()
+        if pval.startswith('"') and pval.endswith('"'):
+            try:
+                pval = json.loads(pval)
+            except json.JSONDecodeError:
+                pval = pval[1:-1]
+        args[pname] = pval
+    return args
+
+
 def _parse_name_json_syntax(text: str) -> dict | None:
     """Parse ToolName{"key":"value"} syntax.
 
@@ -511,16 +531,7 @@ def _parse_name_json_syntax(text: str) -> dict | None:
         pass
 
     # Fallback: extract "key":"value" pairs manually
-    args = {}
-    for kv_match in re.finditer(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|[^,}]+)', balanced_json or json_str):
-        pname = kv_match.group(1)
-        pval = kv_match.group(2).strip()
-        if pval.startswith('"') and pval.endswith('"'):
-            try:
-                pval = json.loads(pval)
-            except json.JSONDecodeError:
-                pval = pval[1:-1]
-        args[pname] = pval
+    args = _extract_kv_pairs(balanced_json or json_str)
 
     if not args:
         return None
@@ -595,16 +606,7 @@ def _parse_truncated_json_syntax(text: str) -> dict | None:
         pass
 
     # Fallback: extract "key":"value" pairs manually
-    args = {}
-    for kv_match in re.finditer(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|[^,}]+)', balanced_json or args_json_str):
-        pname = kv_match.group(1)
-        pval = kv_match.group(2).strip()
-        if pval.startswith('"') and pval.endswith('"'):
-            try:
-                pval = json.loads(pval)
-            except json.JSONDecodeError:
-                pval = pval[1:-1]
-        args[pname] = pval
+    args = _extract_kv_pairs(balanced_json or args_json_str)
 
     if not args:
         return None
@@ -666,16 +668,7 @@ def _parse_comma_json_syntax(text: str) -> dict | None:
         pass
 
     # Fallback: extract "key":"value" pairs manually
-    args = {}
-    for kv_match in re.finditer(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|[^,}]+)', args_str):
-        pname = kv_match.group(1)
-        pval = kv_match.group(2).strip()
-        if pval.startswith('"') and pval.endswith('"'):
-            try:
-                pval = json.loads(pval)
-            except json.JSONDecodeError:
-                pval = pval[1:-1]
-        args[pname] = pval
+    args = _extract_kv_pairs(args_str)
 
     if not args:
         return None

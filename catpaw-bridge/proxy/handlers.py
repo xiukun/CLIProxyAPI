@@ -61,7 +61,8 @@ from proxy.config import (
 from proxy.crypto import (
     encrypt_request,
     decrypt_response_data,
-    RSA_PUBLIC_KEY_PEM,
+    get_rsa_public_key,
+    invalidate_rsa_cache,
 )
 from proxy.auth import (
     get_catpaw_auth,
@@ -78,6 +79,66 @@ from proxy.sse import (
     _create_sse_stream_response,
     _send_keepalive,
 )
+
+
+async def _iter_catpaw_sse(upstream_resp, resp_encrypted_key: str, on_idle=None):
+    """Iterate CatPawAI SSE stream, yielding parsed JSON dicts.
+
+    Shared line-reading + decryption + JSON parsing for both stream and
+    buffer modes. Eliminates the duplicated SSE loop that previously existed
+    in handle_chat_completions.
+
+    Args:
+        upstream_resp: aiohttp ClientResponse (already opened)
+        resp_encrypted_key: encrypted-key header value for decryption ("" if none)
+        on_idle: optional async callback invoked when a non-data line is
+                 received (empty line, non-data: prefix). Used by buffer
+                 mode to send keepalives.
+
+    Yields: parsed catpaw_data dicts (dict)
+    Returns when: ': ping', '[DONE]', or 'lastOne' is encountered.
+    """
+    async for line in upstream_resp.content:
+        line_str = line.decode("utf-8", errors="replace").strip()
+
+        if not line_str:
+            if on_idle:
+                await on_idle()
+            continue
+
+        # ': ping' is CatPawAI's end-of-stream signal
+        if line_str.startswith(": ping"):
+            return
+
+        if not line_str.startswith("data:"):
+            if on_idle:
+                await on_idle()
+            continue
+
+        data_content = line_str[5:].strip()
+        if data_content == "[DONE]":
+            return
+
+        # Decrypt if needed
+        if resp_encrypted_key:
+            try:
+                decrypted = decrypt_response_data(data_content, resp_encrypted_key)
+                catpaw_data = json.loads(decrypted)
+            except Exception as e:
+                if VERBOSE:
+                    print(f"[CatPawProxy] Decrypt error: {e}", flush=True, file=sys.stderr)
+                continue
+        else:
+            try:
+                catpaw_data = json.loads(data_content)
+            except json.JSONDecodeError:
+                continue
+
+        # Check for lastOne (end signal)
+        if catpaw_data.get("lastOne", False):
+            return
+
+        yield catpaw_data
 
 
 async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
@@ -105,7 +166,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     has_tools = bool(openai_body.get("tools"))
 
     # Convert to CatPawAI format
-    catpaw_request = openai_to_catpaw_request(openai_body)
+    catpaw_request = await openai_to_catpaw_request(openai_body)
     catpaw_body_str = json.dumps(catpaw_request, ensure_ascii=False)
 
     if VERBOSE:
@@ -182,6 +243,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
                         print(f"[CatPawProxy] Got 401 from upstream: {error_msg}", flush=True, file=sys.stderr)
                         print(f"[CatPawProxy] Invalidating auth cache, retrying with fresh token...", flush=True, file=sys.stderr)
                         invalidate_auth_cache()
+                        invalidate_rsa_cache()  # CatPawAI may have rotated RSA keys
 
                         try:
                             auth = get_catpaw_auth()
@@ -237,66 +299,28 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
 
                         chunk_count = 0
                         prev_content = ""  # Track accumulated content for delta computation
-                        async for line in upstream_resp.content:
-                            line_str = line.decode("utf-8", errors="replace").strip()
+                        async for catpaw_data in _iter_catpaw_sse(upstream_resp, resp_encrypted_key):
+                            # Convert to OpenAI format and send (with delta computation)
+                            openai_chunk = catpaw_sse_to_openai_sse(catpaw_data, model, is_last=False, prev_content=prev_content)
+                            # Update prev_content for next delta
+                            new_content = _extract_content_from_catpaw(catpaw_data)
+                            if new_content:
+                                prev_content = new_content
+                            await stream_response.write(f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n".encode())
+                            chunk_count += 1
 
-                            if not line_str:
-                                continue
-
-                            # ': ping' is CatPawAI's end-of-stream signal
-                            if line_str.startswith(": ping"):
-                                if VERBOSE:
-                                    print(f"[CatPawProxy] Received : ping (end signal), chunks sent: {chunk_count}", flush=True)
-                                final_chunk = {
-                                    "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": model,
-                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                                }
-                                await stream_response.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
-                                await stream_response.write(b"data: [DONE]\n\n")
-                                break
-
-                            if line_str.startswith("data:"):
-                                data_content = line_str[5:].strip()
-
-                                if data_content == "[DONE]":
-                                    await stream_response.write(b"data: [DONE]\n\n")
-                                    break
-
-                                # Decrypt if needed
-                                if resp_encrypted_key:
-                                    try:
-                                        decrypted = decrypt_response_data(data_content, resp_encrypted_key)
-                                        catpaw_data = json.loads(decrypted)
-                                    except Exception as e:
-                                        print(f"[CatPawProxy] Decrypt error: {e}", flush=True, file=sys.stderr)
-                                        continue
-                                else:
-                                    try:
-                                        catpaw_data = json.loads(data_content)
-                                    except json.JSONDecodeError:
-                                        continue
-
-                                # Check for lastOne (end signal)
-                                if catpaw_data.get("lastOne", False):
-                                    final_chunk = catpaw_sse_to_openai_sse(catpaw_data, model, is_last=True, prev_content=prev_content)
-                                    await stream_response.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
-                                    await stream_response.write(b"data: [DONE]\n\n")
-                                    if VERBOSE:
-                                        print(f"[CatPawProxy] Stream ended (lastOne), chunks sent: {chunk_count}", flush=True)
-                                    break
-
-                                # Convert to OpenAI format and send (with delta computation)
-                                openai_chunk = catpaw_sse_to_openai_sse(catpaw_data, model, is_last=False, prev_content=prev_content)
-                                # Update prev_content for next delta
-                                new_content = _extract_content_from_catpaw(catpaw_data)
-                                if new_content:
-                                    prev_content = new_content
-                                await stream_response.write(f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n".encode())
-                                chunk_count += 1
-
+                        # Stream ended (: ping, [DONE], or lastOne) — send final chunk + [DONE]
+                        if VERBOSE:
+                            print(f"[CatPawProxy] Stream ended, chunks sent: {chunk_count}", flush=True)
+                        final_chunk = {
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                        await stream_response.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
+                        await stream_response.write(b"data: [DONE]\n\n")
                         await stream_response.write_eof()
                         return stream_response
 
@@ -312,46 +336,15 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
                         # We only need the last value, not all values appended.
                         last_content = ""
                         last_keepalive = [time.time()]
-                        async for line in upstream_resp.content:
-                            line_str = line.decode("utf-8", errors="replace").strip()
 
-                            if not line_str:
-                                await _send_keepalive(keepalive_stream, last_keepalive)
-                                continue
+                        async def _on_idle():
+                            await _send_keepalive(keepalive_stream, last_keepalive)
 
-                            # ': ping' is end-of-stream signal
-                            if line_str.startswith(": ping"):
-                                break
-
-                            if not line_str.startswith("data:"):
-                                await _send_keepalive(keepalive_stream, last_keepalive)
-                                continue
-
-                            data_content = line_str[5:].strip()
-                            if data_content == "[DONE]":
-                                break
-
-                            # Decrypt if needed
-                            if resp_encrypted_key:
-                                try:
-                                    decrypted = decrypt_response_data(data_content, resp_encrypted_key)
-                                    catpaw_data = json.loads(decrypted)
-                                except Exception:
-                                    continue
-                            else:
-                                try:
-                                    catpaw_data = json.loads(data_content)
-                                except json.JSONDecodeError:
-                                    continue
-
-                            if catpaw_data.get("lastOne", False):
-                                break
-
+                        async for catpaw_data in _iter_catpaw_sse(upstream_resp, resp_encrypted_key, on_idle=_on_idle):
                             # Extract content (CatPawAI sends accumulated text, keep last)
                             content = _extract_content_from_catpaw(catpaw_data)
                             if content:
                                 last_content = content
-
                             await _send_keepalive(keepalive_stream, last_keepalive)
 
                         full_content = last_content
@@ -589,7 +582,7 @@ async def handle_health(request: web.Request) -> web.Response:
     """Health check endpoint."""
     try:
         auth = get_catpaw_auth()
-        encryption_enabled = RSA_PUBLIC_KEY_PEM is not None
+        encryption_enabled = get_rsa_public_key() is not None
         return web.json_response({
             "status": "ok",
             "auth": {"mis_id": auth["mis_id"], "token_age": int(time.time() - auth["ts"])},

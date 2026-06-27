@@ -7,12 +7,17 @@ The CatPawAI API requires request bodies to be encrypted:
   4. Set 'encrypted-key' header with the encrypted AES key
 
 RSA keys are extracted from CatPawAI's extension.js (XOR-encrypted).
+
+Keys are lazy-loaded on first use and cached. If CatPawAI updates its
+extension.js (e.g. rotating RSA keys), call invalidate_rsa_cache()
+to force re-extraction on the next encrypt/decrypt call.
 """
 
 import base64
 import re
 import secrets
 import sys
+import threading
 
 from Crypto.Cipher import AES
 from Crypto.PublicKey import RSA
@@ -21,6 +26,10 @@ from Crypto.Hash import SHA1
 from Crypto.Util.Padding import pad, unpad
 
 from proxy.config import VERBOSE
+
+# Lazy-loaded key cache (thread-safe)
+_key_lock = threading.Lock()
+_keys = {"public": None, "private": None, "loaded": False}
 
 
 def _extract_rsa_keys():
@@ -135,7 +144,58 @@ def _extract_rsa_keys():
 
 
 # Extract keys at import time (same behavior as original monolith)
-RSA_PUBLIC_KEY_PEM, RSA_PRIVATE_KEY_PEM = _extract_rsa_keys()
+# RSA_PUBLIC_KEY_PEM, RSA_PRIVATE_KEY_PEM = _extract_rsa_keys()
+
+
+def _ensure_keys_loaded():
+    """Load RSA keys on first use (lazy loading).
+
+    Thread-safe via _key_lock. If keys are already loaded, returns immediately.
+    If keys failed to load on a previous attempt, retries on each call
+    (CatPawAI might have been installed/updated since last attempt).
+    """
+    if _keys["loaded"] and _keys["public"]:
+        return
+    with _key_lock:
+        # Double-check after acquiring lock
+        if _keys["loaded"] and _keys["public"]:
+            return
+        pub, priv = _extract_rsa_keys()
+        _keys["public"] = pub
+        _keys["private"] = priv
+        _keys["loaded"] = True
+
+
+def invalidate_rsa_cache():
+    """Invalidate the RSA key cache, forcing re-extraction on next use.
+
+    Call this when the upstream returns 401 or decryption failures,
+    which may indicate CatPawAI updated its extension.js with new RSA keys.
+    """
+    with _key_lock:
+        _keys["public"] = None
+        _keys["private"] = None
+        _keys["loaded"] = False
+    if VERBOSE:
+        print("[CatPawProxy] RSA key cache invalidated", flush=True)
+
+
+def get_rsa_public_key():
+    """Get the RSA public key PEM string, loading if necessary."""
+    _ensure_keys_loaded()
+    return _keys["public"]
+
+
+def get_rsa_private_key():
+    """Get the RSA private key PEM string, loading if necessary."""
+    _ensure_keys_loaded()
+    return _keys["private"]
+
+
+# Backward-compatible module-level access (evaluated lazily via property-like functions)
+# Other modules should use get_rsa_public_key() / get_rsa_private_key() instead.
+RSA_PUBLIC_KEY_PEM = None  # Deprecated: use get_rsa_public_key()
+RSA_PRIVATE_KEY_PEM = None  # Deprecated: use get_rsa_private_key()
 
 
 def encrypt_request(body_str: str, headers: dict) -> str:
@@ -147,7 +207,8 @@ def encrypt_request(body_str: str, headers: dict) -> str:
     4. Set 'encrypted-key' header
     5. Return encrypted body (base64 string)
     """
-    if not RSA_PUBLIC_KEY_PEM:
+    pub_key = get_rsa_public_key()
+    if not pub_key:
         return body_str
 
     try:
@@ -161,7 +222,7 @@ def encrypt_request(body_str: str, headers: dict) -> str:
         encrypted_body_b64 = base64.b64encode(encrypted_body).decode("utf-8")
 
         # Encrypt AES key with RSA-OAEP-SHA1
-        rsa_key = RSA.importKey(RSA_PUBLIC_KEY_PEM)
+        rsa_key = RSA.importKey(pub_key)
         cipher_rsa = PKCS1_OAEP.new(rsa_key, hashAlgo=SHA1)
         # The AES key is first converted to base64, then encrypted
         aes_key_b64 = base64.b64encode(aes_key).decode("utf-8")
@@ -183,12 +244,13 @@ def decrypt_response_data(encrypted_data: str, encrypted_key: str) -> str:
     1. RSA-OAEP-SHA1 decrypt the encrypted_key -> base64 string -> AES key
     2. AES-128-ECB decrypt the data
     """
-    if not RSA_PRIVATE_KEY_PEM or not encrypted_key:
+    priv_key = get_rsa_private_key()
+    if not priv_key or not encrypted_key:
         return encrypted_data
 
     try:
         # Decrypt AES key with RSA-OAEP-SHA1
-        rsa_key = RSA.importKey(RSA_PRIVATE_KEY_PEM)
+        rsa_key = RSA.importKey(priv_key)
         cipher_rsa = PKCS1_OAEP.new(rsa_key, hashAlgo=SHA1)
         encrypted_key_bytes = base64.b64decode(encrypted_key)
         decrypted_aes_key_b64 = cipher_rsa.decrypt(encrypted_key_bytes)

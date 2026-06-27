@@ -2,11 +2,18 @@
 
 The token is cached for _AUTH_CACHE_TTL seconds. When a 401 is received
 upstream, invalidate_auth_cache() forces a re-read on the next call.
+
+Concurrency: _auth_cache is protected by _auth_lock (threading.Lock).
+We use threading.Lock instead of asyncio.Lock because get_catpaw_auth()
+does blocking I/O (SQLite read) and is called from both sync (app startup)
+and async (request handlers) contexts. The critical section is very short
+(cache check + SQLite read only on cache miss, which happens once per minute).
 """
 
 import json
 import os
 import sqlite3
+import threading
 import time
 
 from proxy.config import (
@@ -20,61 +27,68 @@ from proxy.config import (
 
 # Auth cache
 _auth_cache = {"access_token": None, "mis_id": None, "user_info_id": None, "ts": 0}
+_auth_lock = threading.Lock()
 _AUTH_CACHE_TTL = 60  # 1 minute (was 5 min - too long, token may expire)
 
 
 def invalidate_auth_cache():
     """Invalidate the auth cache, forcing next get_catpaw_auth() to re-read from state.vscdb."""
-    _auth_cache["access_token"] = None
-    _auth_cache["ts"] = 0
+    with _auth_lock:
+        _auth_cache["access_token"] = None
+        _auth_cache["ts"] = 0
     if VERBOSE:
         print("[CatPawProxy] Auth cache invalidated", flush=True)
 
 
 def get_catpaw_auth():
-    """Read SSO accessToken and user info from CatPawAI's state.vscdb."""
-    now = time.time()
-    if _auth_cache["access_token"] and (now - _auth_cache["ts"]) < _AUTH_CACHE_TTL:
-        return _auth_cache
+    """Read SSO accessToken and user info from CatPawAI's state.vscdb.
 
-    vscdb_path = os.path.join(CATPAW_DATA_DIR, "User", "globalStorage", "state.vscdb")
-    if not os.path.exists(vscdb_path):
-        raise RuntimeError(f"CatPawAI state.vscdb not found: {vscdb_path}")
+    Thread-safe via _auth_lock — prevents concurrent requests from both
+    triggering SQLite reads when the cache expires simultaneously.
+    """
+    with _auth_lock:
+        now = time.time()
+        if _auth_cache["access_token"] and (now - _auth_cache["ts"]) < _AUTH_CACHE_TTL:
+            return dict(_auth_cache)  # return a copy to prevent external mutation
 
-    conn = sqlite3.connect(vscdb_path)
-    try:
-        cursor = conn.execute(
-            "SELECT value FROM ItemTable WHERE key = 'catpaw.mt-authentication'"
-        )
-        row = cursor.fetchone()
-        if not row:
-            raise RuntimeError("catpaw.mt-authentication not found in state.vscdb")
+        vscdb_path = os.path.join(CATPAW_DATA_DIR, "User", "globalStorage", "state.vscdb")
+        if not os.path.exists(vscdb_path):
+            raise RuntimeError(f"CatPawAI state.vscdb not found: {vscdb_path}")
 
-        auth_data = json.loads(row[0])
-        mt_auth = json.loads(auth_data["mt.auth"])
+        conn = sqlite3.connect(vscdb_path)
+        try:
+            cursor = conn.execute(
+                "SELECT value FROM ItemTable WHERE key = 'catpaw.mt-authentication'"
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise RuntimeError("catpaw.mt-authentication not found in state.vscdb")
 
-        sessions = mt_auth.get("sessions", [])
-        if not sessions:
-            raise RuntimeError("No SSO sessions found")
+            auth_data = json.loads(row[0])
+            mt_auth = json.loads(auth_data["mt.auth"])
 
-        session = sessions[0]
-        access_token = session["accessToken"]
-        account = session.get("account", {})
+            sessions = mt_auth.get("sessions", [])
+            if not sessions:
+                raise RuntimeError("No SSO sessions found")
 
-        mis_id = account.get("label") or account.get("id", "")
-        user_info_id = account.get("userInfoId", "")
+            session = sessions[0]
+            access_token = session["accessToken"]
+            account = session.get("account", {})
 
-        _auth_cache["access_token"] = access_token
-        _auth_cache["mis_id"] = mis_id
-        _auth_cache["user_info_id"] = user_info_id
-        _auth_cache["ts"] = now
+            mis_id = account.get("label") or account.get("id", "")
+            user_info_id = account.get("userInfoId", "")
 
-        if VERBOSE:
-            print(f"[CatPawProxy] Auth loaded: mis_id={mis_id}, user_info_id={user_info_id}", flush=True)
+            _auth_cache["access_token"] = access_token
+            _auth_cache["mis_id"] = mis_id
+            _auth_cache["user_info_id"] = user_info_id
+            _auth_cache["ts"] = now
 
-        return _auth_cache
-    finally:
-        conn.close()
+            if VERBOSE:
+                print(f"[CatPawProxy] Auth loaded: mis_id={mis_id}, user_info_id={user_info_id}", flush=True)
+
+            return dict(_auth_cache)  # return a copy to prevent external mutation
+        finally:
+            conn.close()
 
 
 def build_catpaw_headers(auth, content_type="application/json"):

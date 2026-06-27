@@ -14,7 +14,7 @@ from proxy.config import (
     VERBOSE,
     STRIP_TOOL_DEFINITIONS,
 )
-from proxy.crypto import RSA_PUBLIC_KEY_PEM
+from proxy.crypto import get_rsa_public_key
 from proxy.auth import get_catpaw_auth
 from proxy.handlers import (
     handle_chat_completions,
@@ -48,7 +48,8 @@ def main():
     print(f"[CatPawProxy] Starting on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
     print(f"[CatPawProxy] Upstream: {CATPAW_API_BASE}", flush=True)
     print(f"[CatPawProxy] Data dir: {CATPAW_DATA_DIR}", flush=True)
-    print(f"[CatPawProxy] Encryption: {'enabled' if RSA_PUBLIC_KEY_PEM else 'disabled'}", flush=True)
+    _pub = get_rsa_public_key()
+    print(f"[CatPawProxy] Encryption: {'enabled' if _pub else 'disabled'}", flush=True)
     print(f"[CatPawProxy] Model: {MODEL_NAME} (type_code={MODEL_TYPE_CODE})", flush=True)
     print(f"[CatPawProxy] Strip tool definitions: {STRIP_TOOL_DEFINITIONS}", flush=True)
 
