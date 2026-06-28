@@ -12,6 +12,9 @@ model_provider = "catpaw"
 
 # 默认模型: CatPawAI 的 glm-5.2
 model = "glm-5.2"
+
+# 推理强度: low | medium | high
+# 注意: 当前 CLIProxyAPI 不支持 max，最高为 high
 model_reasoning_effort = "high"
 
 # 使用 Responses API (Codex 桌面版默认)

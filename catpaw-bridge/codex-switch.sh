@@ -38,6 +38,7 @@ CLIPROXY_HOST="${CLIPROXY_HOST:-127.0.0.1}"
 CLIPROXY_PORT="${CLIPROXY_PORT:-$(read_yaml cliproxy.port 8317)}"
 CLIPROXY_API_KEY="${CLIPROXY_API_KEY:-$(read_yaml cliproxy.api_key sk-catpaw-bridge-key)}"
 _CODEX_MODEL="$(read_yaml codex.model glm-5.2)"
+_CODEX_REASONING_EFFORT="$(read_yaml codex.reasoning_effort high)"
 _CODEX_WIRE_API="$(read_yaml codex.wire_api responses)"
 _CODEX_OFFICIAL_MODEL="$(read_yaml codex.official_model gpt-4.1)"
 _CODEX_OFFICIAL_BASE_URL="$(read_yaml codex.official_base_url https://api.openai.com/v1)"
@@ -63,7 +64,7 @@ _write_catpaw_config() {
 
 model_provider = "catpaw"
 model = "$_CODEX_MODEL"
-model_reasoning_effort = "high"
+model_reasoning_effort = "$_CODEX_REASONING_EFFORT"
 wire_api = "$_CODEX_WIRE_API"
 disable_response_storage = true
 
@@ -85,7 +86,7 @@ _write_official_config() {
 
 model_provider = "openai"
 model = "$_CODEX_OFFICIAL_MODEL"
-model_reasoning_effort = "high"
+model_reasoning_effort = "$_CODEX_REASONING_EFFORT"
 
 [model_providers.openai]
 name = "OpenAI"
@@ -105,6 +106,7 @@ codex_switch() {
             echo "   配置文件: $_CODEX_CONFIG"
             echo "   BASE_URL: http://${CLIPROXY_HOST}:${CLIPROXY_PORT}"
             echo "   MODEL:    $_CODEX_MODEL"
+            echo "   REASONING: $_CODEX_REASONING_EFFORT"
             echo "   WIRE_API: $_CODEX_WIRE_API"
             echo "   API_KEY:  $CLIPROXY_API_KEY"
             echo ""

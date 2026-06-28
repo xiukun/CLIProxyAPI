@@ -26,6 +26,24 @@
         "ANTHROPIC_MODEL": "claude-sonnet-4-20250514",
         "ANTHROPIC_SMALL_FAST_MODEL": "claude-3-5-haiku-20241022"
       }
+    },
+    "catpaw-codex": {
+      "name": "CatPaw Codex (glm-5.2, high)",
+      "codex": {
+        "auth": {
+          "OPENAI_API_KEY": "sk-catpaw-bridge-key"
+        },
+        "config": "model_provider = \"custom\"\nmodel = \"glm-5.2\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"CatPawAI Bridge\"\nbase_url = \"http://127.0.0.1:8317\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n"
+      }
+    },
+    "official-codex": {
+      "name": "OpenAI 官方 (gpt-4.1)",
+      "codex": {
+        "auth": {
+          "OPENAI_API_KEY": "sk-your-openai-key"
+        },
+        "config": "model_provider = \"custom\"\nmodel = \"gpt-4.1\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n"
+      }
     }
   },
   "_comment": "此文件由 bridge.conf.yaml 同步生成。修改配置请编辑 bridge.conf.yaml 后重新运行 generate-profiles.py"
