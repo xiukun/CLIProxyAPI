@@ -35,6 +35,18 @@ import json
 import re
 from proxy.config import VERBOSE
 
+
+def _get_compaction_mode_label(codex_config) -> str:
+    """Get a human-readable label for the compaction mode being used."""
+    if not codex_config:
+        return ""
+    class_name = type(codex_config).__name__
+    if "ClaudeCode" in class_name:
+        return " (Claude Code)"
+    elif "Codex" in class_name:
+        return " (Codex)"
+    return f" ({class_name})"
+
 # Budget: target encrypted body size in bytes.
 # Encryption adds ~43% overhead (AES + base64), and JSON structure adds ~5%.
 # So the safe ratio from raw text to encrypted is ~0.55.
@@ -206,8 +218,9 @@ def compact_messages(messages: list, max_encrypted_body: int, overhead: int = 0,
         max_encrypted_body: max encrypted body size in bytes
         overhead: bytes consumed by system prompt + tools prompt (not counted
                   in message text, but part of the final body)
-        codex_config: optional CodexCompactionConfig instance for Codex-aware
-                      compaction (less aggressive, larger retention limits)
+        codex_config: optional compaction config instance (CodexCompactionConfig
+                      or ClaudeCodeCompactionConfig) for CLI-aware compaction
+                      (less aggressive, larger retention limits)
 
     Returns:
         Compacted message list (may be the same list if no compaction needed)
@@ -241,7 +254,7 @@ def compact_messages(messages: list, max_encrypted_body: int, overhead: int = 0,
     # ---- Phase 1: Tool-aware result compression ----
     result, size_after_p1 = _phase1_compress_tool_results(result, tool_call_id_map, codex_config)
     if VERBOSE:
-        mode = " (Codex)" if codex_config else ""
+        mode = _get_compaction_mode_label(codex_config)
         print(f"[CatPawProxy] Compactor Phase 1{mode} (tool results): {total_size} -> {size_after_p1} bytes", flush=True)
 
     if size_after_p1 <= budget:
@@ -263,6 +276,48 @@ def compact_messages(messages: list, max_encrypted_body: int, overhead: int = 0,
     return result
 
 
+def _find_edit_paired_reads(messages: list, tool_call_id_map: dict) -> set:
+    """Find indices of Read tool results that are paired with a subsequent Edit.
+
+    When an Edit follows a Read, the model needs the Read result to get exact
+    context for old_string. Compressing the Read result would break the Edit.
+    This function identifies such protected Read results.
+
+    Args:
+        messages: message list
+        tool_call_id_map: mapping of tool_call_id → tool_name
+
+    Returns:
+        Set of message indices that are Read results paired with a subsequent Edit.
+    """
+    protected = set()
+    # Find all Edit/MultiEdit tool calls (assistant messages with tool_calls)
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "assistant":
+            continue
+        tool_calls = msg.get("tool_calls") or []
+        has_edit = False
+        for tc in tool_calls:
+            tc_name = tc.get("function", {}).get("name", "")
+            if tc_name in ("Edit", "MultiEdit"):
+                has_edit = True
+                break
+        if not has_edit:
+            continue
+
+        # Find the most recent Read tool result before this Edit
+        for j in range(i - 1, -1, -1):
+            prev_msg = messages[j]
+            if prev_msg.get("role") == "tool":
+                tc_id = prev_msg.get("tool_call_id", "")
+                tool_name = tool_call_id_map.get(tc_id, "")
+                if tool_name == "Read":
+                    protected.add(j)
+                    break  # Only protect the most recent Read
+
+    return protected
+
+
 def _phase1_compress_tool_results(messages: list, tool_call_id_map: dict, codex_config=None) -> tuple:
     """Phase 1: Compress OLD tool results using tool-specific strategies.
 
@@ -273,8 +328,12 @@ def _phase1_compress_tool_results(messages: list, tool_call_id_map: dict, codex_
       - Write/Edit results: keep as-is (already tiny)
       - Grep results: head 300 + tail 80 (matches + count)
 
-    When codex_config is provided, uses Codex-tuned limits (larger retention).
+    When codex_config is provided, uses CLI-tuned limits (larger retention).
+    Supports CodexCompactionConfig and ClaudeCodeCompactionConfig.
     The most recent _RECENT_TOOL_RESULTS_KEEP tool results are kept intact.
+
+    CRITICAL: Read results that are paired with a subsequent Edit are NEVER
+    compressed — the Edit needs the exact context from Read to match old_string.
     """
     # Use Codex-tuned settings if provided
     if codex_config:
@@ -285,12 +344,19 @@ def _phase1_compress_tool_results(messages: list, tool_call_id_map: dict, codex_
         recent_keep = _RECENT_TOOL_RESULTS_KEEP
     from proxy.utils import _extract_text_content
 
+    # Find Read results paired with subsequent Edits — these are protected
+    protected_reads = _find_edit_paired_reads(messages, tool_call_id_map)
+
     # Find indices of all tool messages
     tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
 
     # Determine which tool results to compress (skip the last N)
     compress_from_end = len(tool_indices) - recent_keep
     indices_to_compress = set(tool_indices[:max(0, compress_from_end)])
+
+    # Remove protected Read results from compression set
+    protected_count = len(indices_to_compress & protected_reads)
+    indices_to_compress -= protected_reads
 
     total = 0
     compressed_by_tool = {}  # tool_name → count
@@ -320,7 +386,8 @@ def _phase1_compress_tool_results(messages: list, tool_call_id_map: dict, codex_
 
     if VERBOSE and compressed_by_tool:
         details = ", ".join(f"{k}={v}" for k, v in sorted(compressed_by_tool.items(), key=lambda x: -x[1]))
-        print(f"[CatPawProxy]   Phase 1: compressed {sum(compressed_by_tool.values())} tool results ({details}), kept {recent_keep} recent intact", flush=True)
+        protect_note = f", protected {protected_count} Read+Edit paired results" if protected_count else ""
+        print(f"[CatPawProxy]   Phase 1: compressed {sum(compressed_by_tool.values())} tool results ({details}), kept {recent_keep} recent intact{protect_note}", flush=True)
 
     return messages, total
 
@@ -336,6 +403,7 @@ def _phase2_summarize_old_turns(messages: list, tool_call_id_map: dict, codex_co
       - Tool:       80 chars (just tool name + first line of result)
 
     When codex_config is provided, uses larger limits to preserve more context.
+    Supports CodexCompactionConfig and ClaudeCodeCompactionConfig.
     """
     if codex_config:
         role_summary_len = codex_config.ROLE_SUMMARY_LEN
@@ -421,6 +489,7 @@ def _phase3_hard_truncate(messages: list, budget: int, tool_call_id_map: dict, c
 
     This ensures user intent is preserved even under extreme pressure.
     When codex_config is provided, uses a larger hard truncate limit.
+    Supports CodexCompactionConfig and ClaudeCodeCompactionConfig.
     """
     hard_limit = codex_config.HARD_TRUNCATE_LIMIT if codex_config else _HARD_TRUNCATE_LIMIT
     from proxy.utils import _extract_text_content

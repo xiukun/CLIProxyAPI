@@ -36,6 +36,14 @@ from proxy.codex_aware import (
     enhance_codex_tools_prompt,
     CodexCompactionConfig,
 )
+from proxy.claude_aware import (
+    detect_claude_code,
+    extract_claude_code_instructions,
+    build_claude_code_system_prompt,
+    enhance_claude_code_tools_prompt,
+    ClaudeCodeCompactionConfig,
+    extract_useful_reminder_context,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -49,10 +57,16 @@ _TOOL_DEF_MARKERS = [
     "### Bash",
     "### Write",
     "### Edit",
+    "### MultiEdit",
+    "### Grep",
+    "### Glob",
+    "### TodoWrite",
+    "### Task",
     "## Tools",
     "Use them when needed to accomplish tasks",
     "You are an AI coding assistant",
     "Here is the current state",
+    "Tool availability (filtered by policy)",
 ]
 
 
@@ -124,14 +138,15 @@ def _truncate_messages(messages: list) -> list:
     return result
 
 
-def _filter_messages(messages: list, has_tools: bool, is_codex: bool = False) -> list:
+def _filter_messages(messages: list, has_tools: bool, is_codex: bool = False, is_claude_code: bool = False) -> list:
     """Filter out redundant messages from Claude Code or Codex CLI.
 
     When has_tools is True:
     - DROP system messages (we inject our own custom system prompt)
-      EXCEPTION: For Codex, system messages are EXTRACTED before dropping.
+      EXCEPTION: For Codex/Claude Code, system messages are EXTRACTED before dropping.
     - DROP user messages that are tool definitions (detected by markers)
     - KEEP actual user questions, assistant responses, and tool results
+    - For Claude Code: smart-extract useful context from system-reminders
 
     When has_tools is False:
     - Keep everything (no redundancy issue)
@@ -141,16 +156,18 @@ def _filter_messages(messages: list, has_tools: bool, is_codex: bool = False) ->
 
     filtered = []
     dropped = 0
+    useful_reminder_context = []  # Collected from Claude Code system-reminders
+
     for msg in messages:
         role = msg.get("role", "user")
         content = _extract_text_content(msg.get("content", ""))
 
         # Drop system messages — we replace with our own compact prompt.
-        # For Codex, the system prompt has already been extracted by the caller
-        # (extract_codex_instructions), so it's safe to drop here.
+        # For Codex/Claude Code, the system prompt has already been extracted
+        # by the caller, so it's safe to drop here.
         if role == "system":
             if VERBOSE:
-                label = "Codex" if is_codex else "Claude Code"
+                label = "Codex" if is_codex else ("Claude Code" if is_claude_code else "Claude Code")
                 print(f"[CatPawProxy] Dropped {label} system message ({len(content)} chars)", flush=True)
             dropped += 1
             continue
@@ -159,12 +176,20 @@ def _filter_messages(messages: list, has_tools: bool, is_codex: bool = False) ->
         # These contain CLAUDE.md, skills, session context — not the user's
         # actual request. Stripping them can reduce 80KB → 100 bytes.
         if role == "user" and "<system-reminder>" in content:
-            stripped = _strip_system_reminders(content)
+            if is_claude_code:
+                # Claude Code mode: smart-extract useful context before stripping
+                stripped, useful_ctx = extract_useful_reminder_context(content)
+                if useful_ctx:
+                    useful_reminder_context.append(useful_ctx)
+            else:
+                stripped = _strip_system_reminders(content)
+
             if stripped:
                 # There's real content after stripping — keep it
                 if len(stripped) < len(content):
                     if VERBOSE:
-                        print(f"[CatPawProxy] Stripped system-reminder from user message: {len(content)} -> {len(stripped)} chars", flush=True)
+                        mode_label = " (Claude Code smart-extract)" if is_claude_code else ""
+                        print(f"[CatPawProxy] Stripped system-reminder from user message{mode_label}: {len(content)} -> {len(stripped)} chars", flush=True)
                     msg = dict(msg)
                     if isinstance(msg.get("content"), list):
                         msg["content"] = [{"type": "text", "text": stripped}]
@@ -187,6 +212,24 @@ def _filter_messages(messages: list, has_tools: bool, is_codex: bool = False) ->
 
         filtered.append(msg)
 
+    # If we collected useful reminder context (Claude Code mode),
+    # append it as a compact system note to the first user message.
+    # Allow up to 1000 chars (was 500) since we now extract more useful info
+    # (todo state, errors, git status, file modifications).
+    if useful_reminder_context and filtered:
+        context_text = "\n".join(useful_reminder_context)
+        if len(context_text) > 1000:
+            context_text = context_text[:997] + "..."
+        for msg in filtered:
+            if msg.get("role") == "user":
+                content = _extract_text_content(msg.get("content", ""))
+                enhanced = f"[Context: {context_text}]\n\n{content}"
+                if isinstance(msg.get("content"), list):
+                    msg["content"] = [{"type": "text", "text": enhanced}]
+                else:
+                    msg["content"] = enhanced
+                break
+
     if VERBOSE and dropped:
         print(f"[CatPawProxy] Filtered {dropped} redundant message(s), {len(filtered)} remaining", flush=True)
 
@@ -206,9 +249,10 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
     has_tools = bool(tools)
 
     # ------------------------------------------------------------------
-    # Codex detection: check if this request comes from Codex CLI.
-    # This determines which system prompt, tool definitions, and
-    # compaction settings we use.
+    # CLI detection: check if this request comes from Codex CLI or
+    # Claude Code. This determines which system prompt, tool definitions,
+    # and compaction settings we use.
+    # Detection is exclusive: Codex takes priority over Claude Code.
     # ------------------------------------------------------------------
     is_codex, codex_system_content = detect_codex(messages, tools)
     codex_instructions = ""
@@ -216,6 +260,15 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
         codex_instructions = extract_codex_instructions(codex_system_content)
         if VERBOSE:
             print(f"[CatPawProxy] Codex mode: extracted {len(codex_instructions)} chars of behavioral instructions", flush=True)
+
+    is_claude_code = False
+    claude_code_instructions = ""
+    if not is_codex:
+        is_claude_code, claude_code_system_content = detect_claude_code(messages, tools)
+        if is_claude_code:
+            claude_code_instructions = extract_claude_code_instructions(claude_code_system_content)
+            if VERBOSE:
+                print(f"[CatPawProxy] Claude Code mode: extracted {len(claude_code_instructions)} chars of behavioral instructions", flush=True)
 
     # Log individual message sizes for debugging
     if VERBOSE and messages:
@@ -239,8 +292,8 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
         if has_tools:
             # ---- Tool-aware mode ----
             # 1. Filter out redundant system prompt + tool definitions
-            #    For Codex: system prompt has already been extracted above
-            filtered = _filter_messages(messages, has_tools=True, is_codex=is_codex)
+            #    For Codex/Claude Code: system prompt has already been extracted above
+            filtered = _filter_messages(messages, has_tools=True, is_codex=is_codex, is_claude_code=is_claude_code)
 
             # 2. Truncate remaining messages (per-message hard limits)
             filtered = _truncate_messages(filtered)
@@ -252,8 +305,13 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
                 # rules + apply_patch format + CCG routing + tool calling
                 ccg_ctx = _get_ccg_routing_context()
                 system_prompt = build_codex_system_prompt(codex_instructions, ccg_ctx)
+            elif is_claude_code:
+                # Claude Code-aware system prompt: includes extracted behavioral
+                # rules + CCG routing + tool calling
+                ccg_ctx = _get_ccg_routing_context()
+                system_prompt = build_claude_code_system_prompt(claude_code_instructions, ccg_ctx)
             else:
-                # Non-Codex: use the original cached system prompt
+                # Non-CLI: use the original cached system prompt
                 system_prompt = _CUSTOM_SYSTEM_PROMPT
 
             parts = [system_prompt]
@@ -263,6 +321,10 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
                     # Enhanced tool definitions: preserve parameter types,
                     # descriptions, and enum values (critical for apply_patch)
                     tools_prompt = enhance_codex_tools_prompt(tools)
+                elif is_claude_code:
+                    # Enhanced tool definitions: preserve parameter types,
+                    # descriptions, and enum values (critical for Edit/Write)
+                    tools_prompt = enhance_claude_code_tools_prompt(tools)
                 else:
                     tools_prompt = _inject_tools_prompt(tools)
                 if tools_prompt:
@@ -321,9 +383,15 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
             # 4. Intelligent compaction: budget accounts for prompt overhead
             #    and encryption ratio (handled inside compactor)
             #    For Codex: use Codex-tuned compaction settings (less aggressive)
+            #    For Claude Code: use Claude Code-tuned compaction settings
+            compaction_cfg = None
+            if is_codex:
+                compaction_cfg = CodexCompactionConfig
+            elif is_claude_code:
+                compaction_cfg = ClaudeCodeCompactionConfig
             filtered = compact_messages(
                 filtered, MAX_ENCRYPTED_BODY, overhead=prompt_overhead,
-                codex_config=CodexCompactionConfig if is_codex else None,
+                codex_config=compaction_cfg,
             )
 
             # 5. Add conversation history
