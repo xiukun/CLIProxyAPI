@@ -195,9 +195,15 @@ _CUSTOM_SYSTEM_PROMPT = (
     "- For Read: always Read the file BEFORE editing it.\n"
     "- For Edit: use the EXACT text from the Read result as old_string.\n"
     "- For Write: provide the COMPLETE file content, not just a fragment.\n"
-    "- Do NOT use markdown code blocks with filenames. Use <tool_call> tags.\n"
-    "- Do NOT use function-call syntax like Read(file_path=...).\n"
-    "- Results arrive as 'Tool Result: ...'"
+    "- Results arrive as 'Tool Result: ...'\n"
+    "\n"
+    "### Format Requirements (STRICT)\n"
+    "- ONLY use <tool_call> tags. Do NOT use any other format.\n"
+    '- NO: ToolName<parameters>{"key":"value"}</parameters>\n'
+    "- NO: ToolName(param=\"value\")\n"
+    "- NO: ```json blocks with tool calls\n"
+    "- NO: bare JSON without <tool_call> tags\n"
+    '- Example: <tool_call>{"name":"shell","arguments":{"command":"ls -la"}}</tool_call>'
 )
 
 

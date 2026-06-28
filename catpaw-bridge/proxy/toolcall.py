@@ -14,6 +14,10 @@ Supported output formats (checked in priority order):
   4. Markdown JSON code blocks containing tool call objects
   5. Markdown code blocks with filename (```lang:filepath) → Write calls
   6. Bare JSON: {"name":"ToolName","arguments":{...}} (no tags at all)
+  7. ToolName<parameters>{"key":"value"}</parameters> (bare, no <tool_call> wrapping)
+  8. <tool_call>ToolName<parameters>{...}</parameters></tool_call> (parameters inside tool_call)
+  9. <tool_call>ToolName{"key":"value"}</tool_call> (name-JSON syntax)
+  10. <tool_call>ToolName param="value"</tool_call> (space-separated syntax)
 """
 
 import json
@@ -60,6 +64,17 @@ _RE_NAME_JSON_HEAD = re.compile(r'^(\w[\w.\-]*)\s*(\{.*)', re.DOTALL)
 # omitted the opening {"name":" prefix. Result: ToolName","arguments":{...}}
 _RE_TRUNCATED_JSON = re.compile(r'^(\w[\w.\-]*)","arguments"\s*:\s*(.*)', re.DOTALL)
 
+# Format 10: ToolName<parameters>{...}</parameters>
+# The model (glm-5.2) sometimes outputs this format instead of <tool_call> tags:
+#   exec_command<parameters>{"cmd":"git status","workdir":"/path"}</parameters>
+#   shell<parameters>{"command":"ls -la"}</parameters>
+# Also handles <parameter name="key">value</parameter> inside <parameters>:
+#   exec_command<parameters><parameter name="cmd">git status</parameter></parameters>
+_RE_PARAMETERS_BLOCK = re.compile(r'<parameters>(.*?)</parameters>', re.DOTALL)
+_RE_PARAMETER_NAMED_INNER = re.compile(r'<parameter\s+name="([^"]+)">(.*?)</parameter>', re.DOTALL)
+# Bare ToolName<parameters>...</parameters> (without <tool_call> wrapping)
+_RE_BARE_PARAMETERS = re.compile(r'(\w[\w.\-]*)\s*<parameters>(.*?)</parameters>', re.DOTALL)
+
 # Stray XML tags that leak into tool_call content
 _RE_STRAY_XML = re.compile(r'</?arg_value>|</?parameter>|</?invoke>|</?function_calls>')
 
@@ -68,6 +83,7 @@ _RE_AGENT_PATTERNS = [
     re.compile(r'<function_calls>.*?</function_calls>', re.DOTALL),
     re.compile(r'<invoke\s+name="[^"]*">.*?</invoke>', re.DOTALL),
     re.compile(r'<parameter\s+name="[^"]*">.*?</parameter>', re.DOTALL),
+    re.compile(r'<parameters>.*?</parameters>', re.DOTALL),
     re.compile(r'<antThinking>.*?</antThinking>', re.DOTALL),
     re.compile(r'<plan>.*?</plan>', re.DOTALL),
     re.compile(r'<think>.*?</think>', re.DOTALL),
@@ -77,6 +93,7 @@ _AGENT_ORPHAN_TAGS = [
     '<function_calls>', '</function_calls>',
     '<invoke>', '</invoke>',
     '<parameter>', '</parameter>',
+    '<parameters>', '</parameters>',
     '<antThinking>', '</antThinking>',
     '<plan>', '</plan>',
     '<think>', '</think>',
@@ -805,6 +822,92 @@ def _parse_space_separated_syntax(text: str) -> dict | None:
     }
 
 
+def _parse_parameters_tag_syntax(text: str) -> dict | None:
+    """Parse ToolName<parameters>{...}</parameters> syntax.
+
+    The model (glm-5.2) sometimes outputs this format instead of standard
+    <tool_call> tags, especially when working with Codex CLI tools:
+        exec_command<parameters>{"cmd":"git status","workdir":"/path"}</parameters>
+        shell<parameters>{"command":"ls -la"}</parameters>
+
+    Also handles <parameter name="key">value</parameter> inside <parameters>:
+        exec_command<parameters>
+        <parameter name="cmd">git status</parameter>
+        <parameter name="workdir">/path</parameter>
+        </parameters>
+
+    Returns a tool_call dict or None.
+    """
+    text = text.strip()
+    if not text:
+        return None
+
+    param_match = _RE_PARAMETERS_BLOCK.search(text)
+    if not param_match:
+        return None
+
+    # Tool name is text before <parameters>
+    func_name = text[:param_match.start()].strip()
+    # Clean up stray XML tags from tool name (but NOT <parameters> plural)
+    func_name = _RE_STRAY_XML.sub('', func_name).strip()
+    # Remove any trailing punctuation/newlines
+    func_name = func_name.rstrip('.,;:\n\r\t ')
+
+    if not func_name or not re.match(r'^[\w.\-]+$', func_name):
+        return None
+
+    param_content = param_match.group(1).strip()
+    args = {}
+
+    # Strategy 1: Try parsing as JSON object
+    if param_content.startswith('{'):
+        balanced_json, _ = _find_balanced_json(param_content, 0)
+        if balanced_json:
+            try:
+                parsed = json.loads(balanced_json)
+                if isinstance(parsed, dict):
+                    args = parsed
+            except json.JSONDecodeError:
+                # Try with newline escaping
+                fixed = _escape_raw_newlines_in_strings(balanced_json)
+                try:
+                    parsed = json.loads(fixed)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                except json.JSONDecodeError:
+                    # Try with quote fixing
+                    fixed2 = _fix_unescaped_quotes_in_json(fixed)
+                    try:
+                        parsed = json.loads(fixed2)
+                        if isinstance(parsed, dict):
+                            args = parsed
+                    except json.JSONDecodeError:
+                        pass
+
+    # Strategy 2: Try <parameter name="key">value</parameter> format
+    if not args:
+        for param_inner in _RE_PARAMETER_NAMED_INNER.finditer(param_content):
+            pname = param_inner.group(1)
+            pval = param_inner.group(2).strip()
+            args[pname] = pval
+
+    # Strategy 3: Try KV pair extraction as last resort
+    if not args:
+        args = _extract_kv_pairs(param_content)
+
+    if not args:
+        return None
+
+    return {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {
+            "name": func_name,
+            "arguments": json.dumps(args, ensure_ascii=False),
+        }
+    }
+
+
 def _find_closing_tag_outside_json(content: str, close_tags: list) -> tuple:
     """Find the earliest closing tag that is NOT inside a JSON string.
 
@@ -860,6 +963,9 @@ _KNOWN_TOOL_NAMES = frozenset([
     'delete_file', 'read_file', 'write_file', 'edit_file',
     'list_dir', 'codebase_search', 'web_search', 'run_terminal_cmd',
     'todo_write', 'string_replace', 'MultiEdit',
+    # Codex CLI tool names
+    'shell', 'exec_command', 'container_exec', 'apply_patch',
+    'create_file', 'delete_file', 'read_file', 'write_file',
 ])
 
 
@@ -1025,6 +1131,15 @@ def _find_tag_tool_calls(content: str, tag_name: str) -> list:
         if tc:
             if VERBOSE:
                 print(f"[CatPawProxy] Parsed comma-JSON syntax: {tc['function']['name']}", flush=True)
+            results.append((tag_pos, end_pos, tc))
+            search_pos = end_pos
+            continue
+
+        # Try parameters-tag syntax: ToolName<parameters>{...}</parameters>
+        tc = _parse_parameters_tag_syntax(inner)
+        if tc:
+            if VERBOSE:
+                print(f"[CatPawProxy] Parsed parameters-tag syntax: {tc['function']['name']}", flush=True)
             results.append((tag_pos, end_pos, tc))
             search_pos = end_pos
             continue
@@ -1195,6 +1310,25 @@ def _parse_tool_calls(content: str) -> tuple:
             print(f"[CatPawProxy] Parsed bare-JSON tool call: {tc['function']['name']}", flush=True)
         return clean_text, [tc]
 
+    # Format 7: Bare ToolName<parameters>{...}</parameters> (no <tool_call> wrapping)
+    # The model (glm-5.2) sometimes outputs this format directly without <tool_call> tags:
+    #   exec_command<parameters>{"cmd":"git status","workdir":"/path"}</parameters>
+    # This is common when working with Codex CLI tools.
+    bare_param_match = _RE_BARE_PARAMETERS.search(content)
+    if bare_param_match:
+        tc = _parse_parameters_tag_syntax(
+            bare_param_match.group(1) + '<parameters>' + bare_param_match.group(2) + '</parameters>'
+        )
+        if tc:
+            # Remove the matched region from content
+            clean_text = (content[:bare_param_match.start()] + content[bare_param_match.end():]).strip()
+            clean_text = _strip_agent_xml(clean_text)
+            clean_text = re.sub(r'</?tool_call>', '', clean_text).strip()
+            clean_text = _RE_AGENT_STATUS.sub('', clean_text).strip()
+            if VERBOSE:
+                print(f"[CatPawProxy] Parsed bare parameters-tag tool call: {tc['function']['name']}", flush=True)
+            return clean_text, [tc]
+
     # No tool calls found — still strip agent XML artifacts from content
     # Also strip <tool_call> tags that failed to parse
     content = _strip_agent_xml(content)
@@ -1262,6 +1396,45 @@ def _inject_tools_prompt(tools: list) -> str:
     return "\n".join(lines)
 
 
+def _normalize_assistant_content(content: str) -> str:
+    """Normalize bare JSON tool calls in assistant content to <tool_call> format.
+
+    When the model previously output bare JSON (without <tool_call> tags), Codex CLI
+    parsed and executed it, then stored the result in the same assistant message.
+    This creates polluted conversation history like:
+        {"name":"exec_command","arguments":{"cmd":"git status"}}\\n\\nTool Result: ...
+
+    This function detects and wraps bare JSON tool calls in <tool_call> tags so the
+    model sees consistent formatting in conversation history.
+    """
+    if not content or len(content) < 20:
+        return content
+
+    # Quick check: if there's no {"name" pattern, skip entirely
+    if '{"name"' not in content and '{ "name"' not in content:
+        return content
+
+    # Also skip if content already has <tool_call> tags (already normalized)
+    if '<tool_call>' in content:
+        return content
+
+    # Try to find bare JSON tool calls
+    bare_tc = _find_bare_json_tool_call(content)
+    if bare_tc:
+        tc, start, end = bare_tc
+        # Wrap the bare JSON in <tool_call> tags
+        tc_json = json.dumps({
+            "name": tc["function"]["name"],
+            "arguments": json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+        }, ensure_ascii=False)
+        normalized = content[:start] + f'<tool_call>{tc_json}</tool_call>' + content[end:]
+        if VERBOSE:
+            print(f"[CatPawProxy] Normalized bare JSON in assistant history: {tc['function']['name']}", flush=True)
+        return normalized
+
+    return content
+
+
 def _convert_messages_with_tools(messages: list) -> str:
     """Convert OpenAI messages (including tool_calls and tool role) to text.
 
@@ -1290,6 +1463,10 @@ def _convert_messages_with_tools(messages: list) -> str:
         if role == "assistant":
             content = _extract_text_content(msg.get("content", ""))
             tool_calls = msg.get("tool_calls", [])
+
+            # Normalize bare JSON tool calls in content (from pre-fix history)
+            if content and not tool_calls:
+                content = _normalize_assistant_content(content)
 
             if content:
                 parts.append(f"Assistant: {content}")
