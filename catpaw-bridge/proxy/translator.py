@@ -28,6 +28,14 @@ from proxy.utils import _extract_text_content
 from proxy.compactor import compact_messages, compact_merged_content
 from proxy.memory import get_summary_prefix, save_memory, _conv_hash
 from proxy.ccg_context import CUSTOM_SYSTEM_PROMPT as _CUSTOM_SYSTEM_PROMPT
+from proxy.ccg_context import get_ccg_routing_context as _get_ccg_routing_context
+from proxy.codex_aware import (
+    detect_codex,
+    extract_codex_instructions,
+    build_codex_system_prompt,
+    enhance_codex_tools_prompt,
+    CodexCompactionConfig,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -116,11 +124,12 @@ def _truncate_messages(messages: list) -> list:
     return result
 
 
-def _filter_messages(messages: list, has_tools: bool) -> list:
-    """Filter out Claude Code's redundant messages.
+def _filter_messages(messages: list, has_tools: bool, is_codex: bool = False) -> list:
+    """Filter out redundant messages from Claude Code or Codex CLI.
 
     When has_tools is True:
     - DROP system messages (we inject our own custom system prompt)
+      EXCEPTION: For Codex, system messages are EXTRACTED before dropping.
     - DROP user messages that are tool definitions (detected by markers)
     - KEEP actual user questions, assistant responses, and tool results
 
@@ -136,10 +145,13 @@ def _filter_messages(messages: list, has_tools: bool) -> list:
         role = msg.get("role", "user")
         content = _extract_text_content(msg.get("content", ""))
 
-        # Drop system messages — we replace with our own compact prompt
+        # Drop system messages — we replace with our own compact prompt.
+        # For Codex, the system prompt has already been extracted by the caller
+        # (extract_codex_instructions), so it's safe to drop here.
         if role == "system":
             if VERBOSE:
-                print(f"[CatPawProxy] Dropped system message ({len(content)} chars)", flush=True)
+                label = "Codex" if is_codex else "Claude Code"
+                print(f"[CatPawProxy] Dropped {label} system message ({len(content)} chars)", flush=True)
             dropped += 1
             continue
 
@@ -193,6 +205,18 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
     tools = openai_body.get("tools", [])
     has_tools = bool(tools)
 
+    # ------------------------------------------------------------------
+    # Codex detection: check if this request comes from Codex CLI.
+    # This determines which system prompt, tool definitions, and
+    # compaction settings we use.
+    # ------------------------------------------------------------------
+    is_codex, codex_system_content = detect_codex(messages, tools)
+    codex_instructions = ""
+    if is_codex:
+        codex_instructions = extract_codex_instructions(codex_system_content)
+        if VERBOSE:
+            print(f"[CatPawProxy] Codex mode: extracted {len(codex_instructions)} chars of behavioral instructions", flush=True)
+
     # Log individual message sizes for debugging
     if VERBOSE and messages:
         for i, msg in enumerate(messages):
@@ -214,18 +238,33 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
     else:
         if has_tools:
             # ---- Tool-aware mode ----
-            # 1. Filter out Claude Code's redundant system prompt + tool definitions
-            filtered = _filter_messages(messages, has_tools=True)
+            # 1. Filter out redundant system prompt + tool definitions
+            #    For Codex: system prompt has already been extracted above
+            filtered = _filter_messages(messages, has_tools=True, is_codex=is_codex)
 
             # 2. Truncate remaining messages (per-message hard limits)
             filtered = _truncate_messages(filtered)
 
             # 3. Build system prompt + tool definitions FIRST, so we know
             #    their size and can pass the overhead to the compactor
-            parts = [_CUSTOM_SYSTEM_PROMPT]
+            if is_codex:
+                # Codex-aware system prompt: includes extracted behavioral
+                # rules + apply_patch format + CCG routing + tool calling
+                ccg_ctx = _get_ccg_routing_context()
+                system_prompt = build_codex_system_prompt(codex_instructions, ccg_ctx)
+            else:
+                # Non-Codex: use the original cached system prompt
+                system_prompt = _CUSTOM_SYSTEM_PROMPT
+
+            parts = [system_prompt]
             tools_prompt = ""
             if not STRIP_TOOL_DEFINITIONS:
-                tools_prompt = _inject_tools_prompt(tools)
+                if is_codex:
+                    # Enhanced tool definitions: preserve parameter types,
+                    # descriptions, and enum values (critical for apply_patch)
+                    tools_prompt = enhance_codex_tools_prompt(tools)
+                else:
+                    tools_prompt = _inject_tools_prompt(tools)
                 if tools_prompt:
                     parts.append(tools_prompt)
 
@@ -281,7 +320,11 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
 
             # 4. Intelligent compaction: budget accounts for prompt overhead
             #    and encryption ratio (handled inside compactor)
-            filtered = compact_messages(filtered, MAX_ENCRYPTED_BODY, overhead=prompt_overhead)
+            #    For Codex: use Codex-tuned compaction settings (less aggressive)
+            filtered = compact_messages(
+                filtered, MAX_ENCRYPTED_BODY, overhead=prompt_overhead,
+                codex_config=CodexCompactionConfig if is_codex else None,
+            )
 
             # 5. Add conversation history
             conversation = _convert_messages_with_tools(filtered)

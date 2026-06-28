@@ -162,13 +162,17 @@ def _get_tool_name_for_result(msg: dict, tool_call_id_map: dict) -> str:
     return ""
 
 
-def _truncate_tool_result(content: str, tool_name: str) -> str:
+def _truncate_tool_result(content: str, tool_name: str, tool_truncation: dict = None) -> str:
     """Truncate a tool result using tool-specific limits.
 
     Returns the (possibly truncated) content.
     If content is small enough, returns it unchanged.
+
+    Args:
+        tool_truncation: override truncation table (for Codex-aware compaction)
     """
-    limits = _TOOL_TRUNCATION.get(tool_name, _DEFAULT_TRUNCATION)
+    truncation_table = tool_truncation if tool_truncation else _TOOL_TRUNCATION
+    limits = truncation_table.get(tool_name, _DEFAULT_TRUNCATION)
     head = limits["head"]
     tail = limits["tail"]
 
@@ -194,7 +198,7 @@ def _truncate_tool_result(content: str, tool_name: str) -> str:
         return f"{head_part}\n... [compacted: {skipped} chars omitted] ..."
 
 
-def compact_messages(messages: list, max_encrypted_body: int, overhead: int = 0) -> list:
+def compact_messages(messages: list, max_encrypted_body: int, overhead: int = 0, codex_config=None) -> list:
     """Compact message list to fit within the encrypted body budget.
 
     Args:
@@ -202,6 +206,8 @@ def compact_messages(messages: list, max_encrypted_body: int, overhead: int = 0)
         max_encrypted_body: max encrypted body size in bytes
         overhead: bytes consumed by system prompt + tools prompt (not counted
                   in message text, but part of the final body)
+        codex_config: optional CodexCompactionConfig instance for Codex-aware
+                      compaction (less aggressive, larger retention limits)
 
     Returns:
         Compacted message list (may be the same list if no compaction needed)
@@ -233,15 +239,16 @@ def compact_messages(messages: list, max_encrypted_body: int, overhead: int = 0)
     tool_call_id_map = _build_tool_call_id_map(result)
 
     # ---- Phase 1: Tool-aware result compression ----
-    result, size_after_p1 = _phase1_compress_tool_results(result, tool_call_id_map)
+    result, size_after_p1 = _phase1_compress_tool_results(result, tool_call_id_map, codex_config)
     if VERBOSE:
-        print(f"[CatPawProxy] Compactor Phase 1 (tool results): {total_size} -> {size_after_p1} bytes", flush=True)
+        mode = " (Codex)" if codex_config else ""
+        print(f"[CatPawProxy] Compactor Phase 1{mode} (tool results): {total_size} -> {size_after_p1} bytes", flush=True)
 
     if size_after_p1 <= budget:
         return result
 
     # ---- Phase 2: Role-aware old turn summarization ----
-    result, size_after_p2 = _phase2_summarize_old_turns(result, tool_call_id_map)
+    result, size_after_p2 = _phase2_summarize_old_turns(result, tool_call_id_map, codex_config)
     if VERBOSE:
         print(f"[CatPawProxy] Compactor Phase 2 (old turns): {size_after_p1} -> {size_after_p2} bytes", flush=True)
 
@@ -249,14 +256,14 @@ def compact_messages(messages: list, max_encrypted_body: int, overhead: int = 0)
         return result
 
     # ---- Phase 3: Priority-aware hard truncation ----
-    result, size_after_p3 = _phase3_hard_truncate(result, budget, tool_call_id_map)
+    result, size_after_p3 = _phase3_hard_truncate(result, budget, tool_call_id_map, codex_config)
     if VERBOSE:
         print(f"[CatPawProxy] Compactor Phase 3 (hard trunc): {size_after_p2} -> {size_after_p3} bytes", flush=True)
 
     return result
 
 
-def _phase1_compress_tool_results(messages: list, tool_call_id_map: dict) -> tuple:
+def _phase1_compress_tool_results(messages: list, tool_call_id_map: dict, codex_config=None) -> tuple:
     """Phase 1: Compress OLD tool results using tool-specific strategies.
 
     Identifies which tool produced each result (Read, Bash, Write, etc.)
@@ -266,15 +273,23 @@ def _phase1_compress_tool_results(messages: list, tool_call_id_map: dict) -> tup
       - Write/Edit results: keep as-is (already tiny)
       - Grep results: head 300 + tail 80 (matches + count)
 
+    When codex_config is provided, uses Codex-tuned limits (larger retention).
     The most recent _RECENT_TOOL_RESULTS_KEEP tool results are kept intact.
     """
+    # Use Codex-tuned settings if provided
+    if codex_config:
+        tool_truncation = codex_config.TOOL_TRUNCATION
+        recent_keep = codex_config.RECENT_TOOL_RESULTS_KEEP
+    else:
+        tool_truncation = _TOOL_TRUNCATION
+        recent_keep = _RECENT_TOOL_RESULTS_KEEP
     from proxy.utils import _extract_text_content
 
     # Find indices of all tool messages
     tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
 
     # Determine which tool results to compress (skip the last N)
-    compress_from_end = len(tool_indices) - _RECENT_TOOL_RESULTS_KEEP
+    compress_from_end = len(tool_indices) - recent_keep
     indices_to_compress = set(tool_indices[:max(0, compress_from_end)])
 
     total = 0
@@ -289,7 +304,7 @@ def _phase1_compress_tool_results(messages: list, tool_call_id_map: dict) -> tup
             tool_name = _get_tool_name_for_result(msg, tool_call_id_map)
             original_len = len(content)
 
-            compressed = _truncate_tool_result(content, tool_name)
+            compressed = _truncate_tool_result(content, tool_name, tool_truncation)
 
             if len(compressed) < original_len:
                 compressed_by_tool[tool_name or "unknown"] = compressed_by_tool.get(tool_name or "unknown", 0) + 1
@@ -305,12 +320,12 @@ def _phase1_compress_tool_results(messages: list, tool_call_id_map: dict) -> tup
 
     if VERBOSE and compressed_by_tool:
         details = ", ".join(f"{k}={v}" for k, v in sorted(compressed_by_tool.items(), key=lambda x: -x[1]))
-        print(f"[CatPawProxy]   Phase 1: compressed {sum(compressed_by_tool.values())} tool results ({details}), kept {_RECENT_TOOL_RESULTS_KEEP} recent intact", flush=True)
+        print(f"[CatPawProxy]   Phase 1: compressed {sum(compressed_by_tool.values())} tool results ({details}), kept {recent_keep} recent intact", flush=True)
 
     return messages, total
 
 
-def _phase2_summarize_old_turns(messages: list, tool_call_id_map: dict) -> tuple:
+def _phase2_summarize_old_turns(messages: list, tool_call_id_map: dict, codex_config=None) -> tuple:
     """Phase 2: Summarize old conversation turns with role-specific limits.
 
     A "turn" is a user message + assistant response (+ optional tool results).
@@ -319,18 +334,26 @@ def _phase2_summarize_old_turns(messages: list, tool_call_id_map: dict) -> tuple
       - User:      200 chars (user's actual intent is critical)
       - Assistant: 100 chars (what the model was doing)
       - Tool:       80 chars (just tool name + first line of result)
+
+    When codex_config is provided, uses larger limits to preserve more context.
     """
+    if codex_config:
+        role_summary_len = codex_config.ROLE_SUMMARY_LEN
+        recent_turns_keep = codex_config.RECENT_TURNS_KEEP
+    else:
+        role_summary_len = _ROLE_SUMMARY_LEN
+        recent_turns_keep = _RECENT_TURNS_KEEP
     # Identify turn boundaries (each user message starts a new turn)
     turn_starts = []
     for i, msg in enumerate(messages):
         if msg.get("role") == "user":
             turn_starts.append(i)
 
-    if len(turn_starts) <= _RECENT_TURNS_KEEP:
+    if len(turn_starts) <= recent_turns_keep:
         total = sum(_measure_message_size(m) for m in messages)
         return messages, total
 
-    keep_from_idx = turn_starts[-_RECENT_TURNS_KEEP] if len(turn_starts) >= _RECENT_TURNS_KEEP else 0
+    keep_from_idx = turn_starts[-recent_turns_keep] if len(turn_starts) >= recent_turns_keep else 0
 
     from proxy.utils import _extract_text_content
 
@@ -356,7 +379,7 @@ def _phase2_summarize_old_turns(messages: list, tool_call_id_map: dict) -> tuple
         content = _extract_text_content(msg.get("content", ""))
 
         # Get role-specific summary length
-        summary_len = _ROLE_SUMMARY_LEN.get(role, _DEFAULT_SUMMARY_LEN)
+        summary_len = role_summary_len.get(role, _DEFAULT_SUMMARY_LEN)
 
         if not content or len(content) <= summary_len:
             total += content_size
@@ -388,7 +411,7 @@ def _phase2_summarize_old_turns(messages: list, tool_call_id_map: dict) -> tuple
     return messages, total
 
 
-def _phase3_hard_truncate(messages: list, budget: int, tool_call_id_map: dict) -> tuple:
+def _phase3_hard_truncate(messages: list, budget: int, tool_call_id_map: dict, codex_config=None) -> tuple:
     """Phase 3: Hard truncate with priority-aware ordering.
 
     Trims from oldest first, but respects priority:
@@ -397,7 +420,9 @@ def _phase3_hard_truncate(messages: list, budget: int, tool_call_id_map: dict) -
       - User messages trimmed last (small but critical)
 
     This ensures user intent is preserved even under extreme pressure.
+    When codex_config is provided, uses a larger hard truncate limit.
     """
+    hard_limit = codex_config.HARD_TRUNCATE_LIMIT if codex_config else _HARD_TRUNCATE_LIMIT
     from proxy.utils import _extract_text_content
 
     # Calculate sizes
@@ -427,10 +452,10 @@ def _phase3_hard_truncate(messages: list, budget: int, tool_call_id_map: dict) -
             break
 
         content = _extract_text_content(messages[i].get("content", ""))
-        if len(content) <= _HARD_TRUNCATE_LIMIT:
+        if len(content) <= hard_limit:
             continue
 
-        excess = len(content) - _HARD_TRUNCATE_LIMIT
+        excess = len(content) - hard_limit
         trim = min(excess, overflow)
         if trim <= 0:
             continue
