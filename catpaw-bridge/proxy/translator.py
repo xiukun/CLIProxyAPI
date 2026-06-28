@@ -22,6 +22,7 @@ from proxy.toolcall import (
     _inject_tools_prompt,
     _convert_messages_with_tools,
     _strip_agent_xml,
+    _normalize_assistant_content,
 )
 from proxy.utils import _extract_text_content
 from proxy.compactor import compact_messages, compact_merged_content
@@ -256,6 +257,27 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
                         print(f"[CatPawProxy] Memory: replaced {len(old_msgs)} old msgs with summary prefix ({len(memory_prefix)} chars)", flush=True)
 
             prompt_overhead = len("\n\n".join(parts))  # system + tools prompt + memory size
+
+            # 3.6. Pre-compaction normalization: normalize bare JSON in assistant
+            #      messages BEFORE compaction. The compactor may truncate message
+            #      content, and if it truncates a bare JSON tool call mid-string,
+            #      the resulting truncated JSON is unparseable. By normalizing
+            #      first, bare JSON becomes <tool_call> tags which are more
+            #      resilient to truncation (they're just text, not structured JSON).
+            normalized_count = 0
+            for msg in filtered:
+                if msg.get("role") == "assistant":
+                    content = _extract_text_content(msg.get("content", ""))
+                    if content and '{"name"' in content and '<tool_call>' not in content:
+                        normalized = _normalize_assistant_content(content)
+                        if normalized != content:
+                            if isinstance(msg.get("content"), list):
+                                msg["content"] = [{"type": "text", "text": normalized}]
+                            else:
+                                msg["content"] = normalized
+                            normalized_count += 1
+            if normalized_count and VERBOSE:
+                print(f"[CatPawProxy] Pre-compaction: normalized {normalized_count} bare JSON assistant message(s)", flush=True)
 
             # 4. Intelligent compaction: budget accounts for prompt overhead
             #    and encryption ratio (handled inside compactor)

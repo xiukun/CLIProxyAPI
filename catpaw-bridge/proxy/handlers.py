@@ -10,6 +10,7 @@ handle_chat_completions is the core endpoint that:
 
 import asyncio
 import json
+import re
 import sys
 import time
 import uuid
@@ -348,6 +349,16 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
                             await _send_keepalive(keepalive_stream, last_keepalive)
 
                         full_content = last_content
+
+                        # Strip null bytes and other control characters that may
+                        # leak from upstream (CatPawAI sometimes sends null bytes
+                        # in the SSE stream, especially after large requests).
+                        # These corrupt JSON parsing and tool call detection.
+                        if full_content:
+                            full_content = full_content.replace("\x00", "")
+                            # Also strip other non-printable control chars except
+                            # newline, tab, and carriage return
+                            full_content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', full_content)
 
                         # Log response content for debugging when tools are present
                         if has_tools and VERBOSE:

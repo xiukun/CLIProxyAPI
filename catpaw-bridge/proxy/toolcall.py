@@ -414,6 +414,103 @@ def _fix_invalid_json_escapes(s: str) -> str:
     return ''.join(result)
 
 
+def _regex_extract_tool_call(text: str) -> dict | None:
+    """Last-resort extraction using regex for badly malformed JSON.
+
+    Handles cases where the model outputs JSON with:
+    - Missing closing quotes in string values
+    - Extra closing braces (}}})
+    - No closing </tool_call> tag
+    - Truncated JSON
+
+    Example input:
+      {"name":"exec_command","arguments":{"cmd": "cat file | grep 'pattern'}}}
+
+    This function bypasses json.loads entirely and uses regex to extract
+    the tool name and argument key-value pairs.
+    """
+    # Extract tool name (this part is usually well-formed)
+    name_match = re.search(r'"name"\s*:\s*"([^"]*)"', text)
+    if not name_match:
+        return None
+    tool_name = name_match.group(1)
+
+    # Extract arguments
+    args = {}
+
+    # Find the arguments block
+    args_match = re.search(r'"arguments"\s*:\s*\{', text)
+    if args_match:
+        args_text = text[args_match.end():]  # everything after "arguments": {
+
+        # Extract key-value pairs using regex
+        # Pattern: "key": "value" or "key": 'value' or "key": value
+        kv_pattern = re.compile(r'"(\w+)"\s*:\s*')
+        for m in kv_pattern.finditer(args_text):
+            key = m.group(1)
+            val_start = m.end()
+
+            if val_start >= len(args_text):
+                continue
+
+            # Determine value type and extract
+            if args_text[val_start] == '"':
+                # Double-quoted string value
+                close_quote = args_text.find('"', val_start + 1)
+                if close_quote != -1:
+                    val = args_text[val_start + 1:close_quote]
+                else:
+                    # No closing quote — take everything up to } or end
+                    # Strip trailing } characters
+                    val = args_text[val_start + 1:].rstrip('}').rstrip()
+                args[key] = val
+            elif args_text[val_start] == "'":
+                # Single-quoted string value
+                close_quote = args_text.find("'", val_start + 1)
+                if close_quote != -1:
+                    val = args_text[val_start + 1:close_quote]
+                else:
+                    val = args_text[val_start + 1:].rstrip('}').rstrip()
+                args[key] = val
+            else:
+                # Non-string value (number, boolean, null, array, object)
+                # Take up to , or } (respecting nesting)
+                depth = 0
+                end = val_start
+                while end < len(args_text):
+                    ch = args_text[end]
+                    if ch == '{' or ch == '[':
+                        depth += 1
+                    elif ch == '}' or ch == ']':
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif ch == ',' and depth == 0:
+                        break
+                    end += 1
+                val = args_text[val_start:end].strip()
+                # Try to parse as JSON for non-string types
+                try:
+                    args[key] = json.loads(val)
+                except (json.JSONDecodeError, ValueError):
+                    args[key] = val
+
+    if not tool_name:
+        return None
+
+    if VERBOSE:
+        print(f"[CatPawProxy] Regex extraction: name={tool_name}, args={list(args.keys())}", flush=True)
+
+    return {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": json.dumps(args, ensure_ascii=False),
+        }
+    }
+
+
 def _extract_tool_call(json_str: str) -> dict | None:
     """Extract a single tool call from JSON string.
 
@@ -452,6 +549,14 @@ def _extract_tool_call(json_str: str) -> dict | None:
                         try:
                             data = json.loads(fixed4)
                         except (json.JSONDecodeError, AttributeError) as e2:
+                            # Strategy 7: Regex extraction (handles missing closing
+                            # quotes, extra braces, truncated JSON — bypasses
+                            # json.loads entirely)
+                            tc = _regex_extract_tool_call(json_str)
+                            if tc:
+                                if VERBOSE:
+                                    print(f"[CatPawProxy] Regex extraction succeeded after all JSON parsing failed", flush=True)
+                                return tc
                             if VERBOSE:
                                 print(f"[CatPawProxy] Tool call parse error: {e} (also tried quote fix: {e2})", flush=True)
                             return None
@@ -1060,6 +1165,19 @@ def _find_bare_json_tool_call(content: str) -> tuple | None:
         # Try to extract a balanced JSON object starting here
         json_str, end_pos = _find_balanced_json(content, brace_pos)
         if not json_str:
+            # _find_balanced_json failed (e.g., missing closing " in string
+            # value). Try regex extraction as a fallback.
+            tc = _regex_extract_tool_call(content[brace_pos:])
+            if tc:
+                tc_name = tc.get("function", {}).get("name", "")
+                if tc_name in _KNOWN_TOOL_NAMES or (
+                    re.match(r'^[\w.\-]+$', tc_name)
+                    and (tc_name[0].isupper() or '__' in tc_name)
+                    and len(tc_name) >= 2
+                ):
+                    # Find end position (last } in content)
+                    last_brace = content.rfind('}')
+                    return tc, brace_pos, last_brace + 1 if last_brace != -1 else len(content)
             search_pos = brace_pos + 1
             continue
 
@@ -1155,6 +1273,18 @@ def _find_tag_tool_calls(content: str, tag_name: str) -> list:
                 if tc:
                     if VERBOSE:
                         print(f"[CatPawProxy] Parsed name-JSON syntax: {tc['function']['name']}", flush=True)
+                    results.append((tag_pos, end_pos, tc))
+                    search_pos = end_pos
+                    continue
+            else:
+                # _find_balanced_json failed (e.g., missing closing " in a
+                # string value). Try regex extraction as a fallback — this
+                # bypasses brace matching entirely and uses pattern matching
+                # to extract name and arguments from malformed JSON.
+                tc = _regex_extract_tool_call(inner[json_start:])
+                if tc:
+                    if VERBOSE:
+                        print(f"[CatPawProxy] Parsed malformed-JSON (regex fallback): {tc['function']['name']}", flush=True)
                     results.append((tag_pos, end_pos, tc))
                     search_pos = end_pos
                     continue
@@ -1513,6 +1643,29 @@ def _normalize_assistant_content(content: str) -> str:
                     print(f"[CatPawProxy] Normalized bare JSON (heuristic fallback): {tc['function']['name']}", flush=True)
                 return normalized
             search_from = brace_idx + 2
+
+    # Fallback 2: Truncated JSON — the compactor may have cut off the end of
+    # a bare JSON tool call, leaving it without closing " and }}. Try to
+    # reconstruct the JSON by finding {"name" and adding missing closers.
+    if name_idx != -1:
+        remainder = content[name_idx:]
+        # Check if this looks like a truncated tool call JSON
+        # (has "name" and "arguments" but no proper closing)
+        if '"name"' in remainder and '"arguments"' in remainder:
+            # Try progressively adding missing closing characters
+            for suffix in ['"', '"}', '"}}', '"}}', '"}', '"}}}', '":{}}', '"}]}']:
+                candidate = remainder.rstrip() + suffix
+                fixed = _fix_invalid_json_escapes(candidate)
+                tc = _extract_tool_call(fixed)
+                if tc:
+                    tc_json = json.dumps({
+                        "name": tc["function"]["name"],
+                        "arguments": json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                    }, ensure_ascii=False)
+                    normalized = content[:name_idx] + f'<tool_call>{tc_json}</tool_call>'
+                    if VERBOSE:
+                        print(f"[CatPawProxy] Normalized truncated bare JSON (reconstructed): {tc['function']['name']}", flush=True)
+                    return normalized
 
     return content
 
