@@ -368,6 +368,52 @@ def _escape_raw_newlines_in_strings(s: str) -> str:
     return ''.join(result)
 
 
+def _fix_invalid_json_escapes(s: str) -> str:
+    r"""Fix invalid JSON escape sequences.
+
+    JSON only allows these escape sequences: \" \\ \/ \b \f \n \r \t \uXXXX
+    Models (or Codex CLI history) sometimes output invalid escapes like:
+      \*  -> should be just * (remove the backslash)
+      \'  -> should be just ' (remove the backslash)
+      \!  -> should be just ! (remove the backslash)
+      etc.
+
+    This function walks through the string tracking JSON string state.
+    Inside string values, it removes backslashes before characters that
+    are NOT valid JSON escape characters.
+    """
+    # Valid JSON escape characters after backslash
+    _VALID_ESCAPES = frozenset('"\\/bfnrtu')
+
+    result = []
+    in_string = False
+    escape = False
+
+    for ch in s:
+        if escape:
+            escape = False
+            if ch in _VALID_ESCAPES:
+                # Valid escape — keep as-is
+                result.append('\\')
+                result.append(ch)
+            else:
+                # Invalid escape (e.g. \*, \', \!) — remove the backslash
+                # Keep the character as-is (it's inside a JSON string)
+                result.append(ch)
+            continue
+
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+
+        if ch == '"':
+            in_string = not in_string
+
+        result.append(ch)
+
+    return ''.join(result)
+
+
 def _extract_tool_call(json_str: str) -> dict | None:
     """Extract a single tool call from JSON string.
 
@@ -380,30 +426,35 @@ def _extract_tool_call(json_str: str) -> dict | None:
     try:
         data = json.loads(json_str)
     except (json.JSONDecodeError, AttributeError):
-        # Strategy 2: Escape raw newlines/tabs (models output them unescaped)
-        fixed = _escape_raw_newlines_in_strings(json_str)
+        # Strategy 2: Fix invalid JSON escapes (\*, \', etc. from Codex history)
+        fixed_esc = _fix_invalid_json_escapes(json_str)
         try:
-            data = json.loads(fixed)
+            data = json.loads(fixed_esc)
         except (json.JSONDecodeError, AttributeError):
-            # Strategy 3: Fix unescaped quotes (common in Bash: -name "*.ts")
-            fixed2 = _fix_unescaped_quotes_in_json(fixed)
+            # Strategy 3: Escape raw newlines/tabs (models output them unescaped)
+            fixed = _escape_raw_newlines_in_strings(fixed_esc)
             try:
-                data = json.loads(fixed2)
+                data = json.loads(fixed)
             except (json.JSONDecodeError, AttributeError):
-                # Strategy 4: Full cleaning (last resort — may modify content)
-                fixed3 = _clean_json_string(fixed)
-                fixed3 = _escape_raw_newlines_in_strings(fixed3)
+                # Strategy 4: Fix unescaped quotes (common in Bash: -name "*.ts")
+                fixed2 = _fix_unescaped_quotes_in_json(fixed)
                 try:
-                    data = json.loads(fixed3)
-                except (json.JSONDecodeError, AttributeError) as e:
-                    # Strategy 5: Clean + quote fix (ultimate last resort)
-                    fixed4 = _fix_unescaped_quotes_in_json(fixed3)
+                    data = json.loads(fixed2)
+                except (json.JSONDecodeError, AttributeError):
+                    # Strategy 5: Full cleaning (last resort — may modify content)
+                    fixed3 = _clean_json_string(fixed)
+                    fixed3 = _escape_raw_newlines_in_strings(fixed3)
                     try:
-                        data = json.loads(fixed4)
-                    except (json.JSONDecodeError, AttributeError) as e2:
-                        if VERBOSE:
-                            print(f"[CatPawProxy] Tool call parse error: {e} (also tried quote fix: {e2})", flush=True)
-                        return None
+                        data = json.loads(fixed3)
+                    except (json.JSONDecodeError, AttributeError) as e:
+                        # Strategy 6: Clean + quote fix (ultimate last resort)
+                        fixed4 = _fix_unescaped_quotes_in_json(fixed3)
+                        try:
+                            data = json.loads(fixed4)
+                        except (json.JSONDecodeError, AttributeError) as e2:
+                            if VERBOSE:
+                                print(f"[CatPawProxy] Tool call parse error: {e} (also tried quote fix: {e2})", flush=True)
+                            return None
     tc_name = data.get("name", "")
     if not tc_name:
         return None
@@ -1432,6 +1483,37 @@ def _normalize_assistant_content(content: str) -> str:
             print(f"[CatPawProxy] Normalized bare JSON in assistant history: {tc['function']['name']}", flush=True)
         return normalized
 
+    # Fallback: _find_bare_json_tool_call may fail due to invalid JSON escapes
+    # (e.g. \\* in Codex history). Try a heuristic approach:
+    # 1. Find {"name" in content
+    # 2. Find the closing }} after it
+    # 3. Extract, fix escapes, and try to parse
+    name_idx = content.find('{"name"')
+    if name_idx == -1:
+        name_idx = content.find('{ "name"')
+    if name_idx != -1:
+        # Find closing }} — look for double closing brace
+        search_from = name_idx
+        while True:
+            brace_idx = content.find('}}', search_from)
+            if brace_idx == -1:
+                break
+            # Extract candidate JSON
+            candidate = content[name_idx:brace_idx + 2]
+            # Fix invalid escapes and try to parse
+            fixed = _fix_invalid_json_escapes(candidate)
+            tc = _extract_tool_call(fixed)
+            if tc:
+                tc_json = json.dumps({
+                    "name": tc["function"]["name"],
+                    "arguments": json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"],
+                }, ensure_ascii=False)
+                normalized = content[:name_idx] + f'<tool_call>{tc_json}</tool_call>' + content[brace_idx + 2:]
+                if VERBOSE:
+                    print(f"[CatPawProxy] Normalized bare JSON (heuristic fallback): {tc['function']['name']}", flush=True)
+                return normalized
+            search_from = brace_idx + 2
+
     return content
 
 
@@ -1464,9 +1546,30 @@ def _convert_messages_with_tools(messages: list) -> str:
             content = _extract_text_content(msg.get("content", ""))
             tool_calls = msg.get("tool_calls", [])
 
-            # Normalize bare JSON tool calls in content (from pre-fix history)
-            if content and not tool_calls:
+            # Normalize bare JSON tool calls in content — ALWAYS call, even when
+            # tool_calls exist. Codex CLI sometimes stores the original bare JSON
+            # text in content alongside the parsed tool_calls, causing the model
+            # to see both formats and get confused.
+            if content:
                 content = _normalize_assistant_content(content)
+
+            # After normalization, if content still has bare JSON that couldn't
+            # be parsed (e.g. invalid escapes), strip it to prevent pollution.
+            # Only keep content that has actual text (not just bare JSON).
+            if content and tool_calls:
+                stripped = content.strip()
+                # Drop content entirely if it's ONLY a tool call (bare JSON or
+                # <tool_call> tag) — the tool_calls array already captures it.
+                if (stripped.startswith('{"name"') and stripped.endswith('}}')) or \
+                   (stripped.startswith('<tool_call>') and stripped.endswith('</tool_call>')):
+                    content = ""
+                else:
+                    # Content has text + tool call. Remove <tool_call> blocks
+                    # from content since tool_calls array already has them.
+                    # This prevents duplicate tool calls in the conversation.
+                    content = re.sub(
+                        r'<tool_call>.*?</tool_call>', '', content, flags=re.DOTALL
+                    ).strip()
 
             if content:
                 parts.append(f"Assistant: {content}")
