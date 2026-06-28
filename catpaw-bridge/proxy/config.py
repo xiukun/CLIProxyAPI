@@ -70,6 +70,7 @@ def _load_config() -> dict:
     catpaw = deep_get(cfg, "catpaw", default={})
     model = deep_get(cfg, "model", default={})
     limits = deep_get(cfg, "limits", default={})
+    ccg = deep_get(cfg, "ccg", default={})
 
     return {
         "listen_host": os.environ.get("CATPAW_PROXY_HOST", "127.0.0.1"),
@@ -92,6 +93,7 @@ def _load_config() -> dict:
         "max_encrypted_body": int(limits.get("max_encrypted_body", 180_000)),
         "max_message_content": int(limits.get("max_message_content", 50_000)),
         "max_system_content": int(limits.get("max_system_content", 8_000)),
+        "ccg_enabled": _parse_bool(os.environ.get("CCG_ENABLED"), ccg.get("enabled", True)),
     }
 
 
@@ -115,3 +117,4 @@ MAX_ENCRYPTED_BODY = _CFG["max_encrypted_body"]
 MAX_MESSAGE_CONTENT = _CFG["max_message_content"]
 MAX_SYSTEM_CONTENT = _CFG["max_system_content"]
 STRIP_TOOL_DEFINITIONS = _CFG["strip_tool_definitions"]
+CCG_ENABLED = _CFG["ccg_enabled"]

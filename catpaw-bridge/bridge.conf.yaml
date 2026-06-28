@@ -50,6 +50,17 @@ model:
     - "glm-5.2"
     - "claude-sonnet-4-20250514"
 
+# ---- CCG 技能注入 ----
+# CCG (Code Craft Guide) 路由规则自动注入到系统提示词
+# 启用后，Bridge 会在模块加载时一次性构建增强系统提示词：
+#   1. 初始设置指令（读取 CLAUDE.md / AGENTS.md）
+#   2. CCG 技能路由规则（领域专家知识自动检测）
+#   3. CCG 质量门（代码变更后自动触发）
+#   4. 工具调用规则（格式 + 严格约束）
+# 构建结果缓存在内存中，零每请求开销（高缓存）
+ccg:
+  enabled: true                 # 启用 CCG 上下文注入（检测到 ~/.claude/rules/ 自动启用）
+
 # ---- Claude Code 配置 (cc-switch 用) ----
 claude_code:
   # 直接使用模型名

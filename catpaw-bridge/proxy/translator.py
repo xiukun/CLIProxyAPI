@@ -26,6 +26,7 @@ from proxy.toolcall import (
 from proxy.utils import _extract_text_content
 from proxy.compactor import compact_messages, compact_merged_content
 from proxy.memory import get_summary_prefix, save_memory, _conv_hash
+from proxy.ccg_context import CUSTOM_SYSTEM_PROMPT as _CUSTOM_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -179,32 +180,10 @@ def _filter_messages(messages: list, has_tools: bool) -> list:
     return filtered
 
 
-# Custom system prompt to replace Claude Code's verbose one
-_CUSTOM_SYSTEM_PROMPT = (
-    "You are an AI coding assistant. Follow the user's instructions carefully.\n"
-    "\n"
-    "## Tool Calling (CRITICAL)\n"
-    "When you need to use ANY tool (Read, Write, Edit, Bash, etc.), output:\n"
-    '<tool_call>{"name":"ToolName","arguments":{"param":"value"}}</tool_call>\n'
-    "\n"
-    "### Rules\n"
-    "- Output ONE tool call at a time, then WAIT for the result before continuing.\n"
-    "- Do NOT output multiple tool calls in one response.\n"
-    "- Do NOT describe what you will do — just call the tool directly.\n"
-    "- Do NOT ask for confirmation before writing/editing files.\n"
-    "- For Read: always Read the file BEFORE editing it.\n"
-    "- For Edit: use the EXACT text from the Read result as old_string.\n"
-    "- For Write: provide the COMPLETE file content, not just a fragment.\n"
-    "- Results arrive as 'Tool Result: ...'\n"
-    "\n"
-    "### Format Requirements (STRICT)\n"
-    "- ONLY use <tool_call> tags. Do NOT use any other format.\n"
-    '- NO: ToolName<parameters>{"key":"value"}</parameters>\n'
-    "- NO: ToolName(param=\"value\")\n"
-    "- NO: ```json blocks with tool calls\n"
-    "- NO: bare JSON without <tool_call> tags\n"
-    '- Example: <tool_call>{"name":"shell","arguments":{"command":"ls -la"}}</tool_call>'
-)
+# _CUSTOM_SYSTEM_PROMPT is now imported from proxy.ccg_context
+# It includes: role description + initial setup (read CLAUDE.md/AGENTS.md)
+# + CCG routing rules + tool calling rules + format requirements
+# Built ONCE at module load time for maximum cache efficiency
 
 
 async def openai_to_catpaw_request(openai_body: dict) -> dict:
