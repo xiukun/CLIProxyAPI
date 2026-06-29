@@ -440,40 +440,40 @@ class CodexCompactionConfig:
 
     # Tool-specific truncation for Codex (larger than defaults)
     TOOL_TRUNCATION = {
-        "read_file":      {"head": 600, "tail": 300},   # vs 350+200 default
-        "Read":           {"head": 600, "tail": 300},
-        "shell":          {"head": 500, "tail": 100},   # vs 400+0 default
-        "Bash":           {"head": 500, "tail": 100},
-        "exec_command":   {"head": 500, "tail": 100},
-        "container_exec": {"head": 500, "tail": 100},
+        "read_file":      {"head": 2000, "tail": 1000},  # vs 600+300 — large for code understanding
+        "Read":           {"head": 2000, "tail": 1000},
+        "shell":          {"head": 1000, "tail": 200},   # vs 500+100
+        "Bash":           {"head": 1000, "tail": 200},
+        "exec_command":   {"head": 1000, "tail": 200},
+        "container_exec": {"head": 1000, "tail": 200},
         "apply_patch":    {"head": 99999, "tail": 0},   # keep as-is (usually small)
         "write_file":     {"head": 99999, "tail": 0},
         "Write":          {"head": 99999, "tail": 0},
         "Edit":           {"head": 99999, "tail": 0},
         "MultiEdit":      {"head": 99999, "tail": 0},
-        "Grep":           {"head": 400, "tail": 100},   # vs 300+80 default
-        "Glob":           {"head": 400, "tail": 100},
-        "codebase_search": {"head": 400, "tail": 100},
-        "WebFetch":       {"head": 500, "tail": 150},
-        "WebSearch":      {"head": 500, "tail": 150},
-        "list_dir":       {"head": 300, "tail": 0},
-        "List":           {"head": 300, "tail": 0},
+        "Grep":           {"head": 600, "tail": 200},   # vs 400+100
+        "Glob":           {"head": 500, "tail": 150},
+        "codebase_search": {"head": 600, "tail": 200},
+        "WebFetch":       {"head": 800, "tail": 200},
+        "WebSearch":      {"head": 800, "tail": 200},
+        "list_dir":       {"head": 400, "tail": 0},
+        "List":           {"head": 400, "tail": 0},
         "TodoWrite":      {"head": 99999, "tail": 0},
         "delete_file":    {"head": 99999, "tail": 0},
-        "run_terminal_cmd": {"head": 500, "tail": 0},
+        "run_terminal_cmd": {"head": 1000, "tail": 200},
     }
 
     # Keep more recent items for Codex
-    RECENT_TOOL_RESULTS_KEEP = 5     # vs 3 default
-    RECENT_TURNS_KEEP = 5            # vs 3 default
+    RECENT_TOOL_RESULTS_KEEP = 8     # vs 3 default
+    RECENT_TURNS_KEEP = 8            # vs 3 default
 
     # Less aggressive role summarization for Codex
     ROLE_SUMMARY_LEN = {
-        "user": 300,       # vs 200 default — user intent is critical
-        "assistant": 150,  # vs 100 default — what the model did
-        "tool": 120,       # vs 80 default — tool name + result summary
+        "user": 500,       # vs 200 default — user intent is critical
+        "assistant": 300,  # vs 100 default — what the model did
+        "tool": 250,       # vs 80 default — tool name + result summary
         "system": 100,
     }
 
     # Larger hard truncate limit for Codex
-    HARD_TRUNCATE_LIMIT = 3500  # vs 2500 default
+    HARD_TRUNCATE_LIMIT = 5000  # vs 2500 default

@@ -59,40 +59,40 @@ _COMPACT_RATIO = 0.52
 # Bash results are most useful at the top (ls, find, error messages).
 # Write/Edit results are tiny ("File created successfully") — don't truncate.
 _TOOL_TRUNCATION = {
-    "Read":          {"head": 350, "tail": 200},   # file structure + end
-    "Bash":          {"head": 400, "tail": 0},      # shell output: head only
+    "Read":          {"head": 2000, "tail": 1000},  # file structure + end (large for code understanding)
+    "Bash":          {"head": 1000, "tail": 200},   # shell output: head + error tail
     "Write":         {"head": 99999, "tail": 0},    # keep as-is (usually < 200 chars)
     "Edit":          {"head": 99999, "tail": 0},    # keep as-is
     "MultiEdit":     {"head": 99999, "tail": 0},    # keep as-is
-    "Grep":          {"head": 300, "tail": 80},     # matches + file count
-    "Glob":          {"head": 300, "tail": 80},     # file list
-    "list_dir":      {"head": 200, "tail": 0},      # directory listing
-    "List":          {"head": 200, "tail": 0},
-    "WebFetch":      {"head": 400, "tail": 100},    # article + conclusion
-    "WebSearch":     {"head": 400, "tail": 100},
-    "codebase_search": {"head": 300, "tail": 80},
+    "Grep":          {"head": 500, "tail": 150},    # matches + file count
+    "Glob":          {"head": 400, "tail": 100},    # file list
+    "list_dir":      {"head": 300, "tail": 0},      # directory listing
+    "List":          {"head": 300, "tail": 0},
+    "WebFetch":      {"head": 600, "tail": 200},    # article + conclusion
+    "WebSearch":     {"head": 600, "tail": 200},
+    "codebase_search": {"head": 500, "tail": 150},
     "TodoWrite":     {"head": 99999, "tail": 0},    # keep as-is (structured data)
     "delete_file":   {"head": 99999, "tail": 0},    # keep as-is
-    "run_terminal_cmd": {"head": 400, "tail": 0},   # command output
+    "run_terminal_cmd": {"head": 1000, "tail": 200}, # command output
 }
-_DEFAULT_TRUNCATION = {"head": 300, "tail": 100}  # default for unknown tools
-_RECENT_TOOL_RESULTS_KEEP = 3  # keep this many recent tool results intact
+_DEFAULT_TRUNCATION = {"head": 500, "tail": 200}  # default for unknown tools
+_RECENT_TOOL_RESULTS_KEEP = 8  # keep this many recent tool results intact
 
 # Phase 2: Role-specific summary lengths
 # User messages contain the actual task — preserve more.
 # Assistant messages are explanations — less critical.
 # Tool results are just data — least critical when old.
 _ROLE_SUMMARY_LEN = {
-    "user": 200,       # user's actual intent is critical
-    "assistant": 100,  # what the model was doing
-    "tool": 80,        # just tool name + first line
+    "user": 500,       # user's actual intent is critical
+    "assistant": 300,  # what the model was doing
+    "tool": 250,       # just tool name + first line
     "system": 100,     # usually already filtered, but just in case
 }
-_DEFAULT_SUMMARY_LEN = 120
-_RECENT_TURNS_KEEP = 3    # keep this many most recent message turns intact
+_DEFAULT_SUMMARY_LEN = 300
+_RECENT_TURNS_KEEP = 8    # keep this many most recent message turns intact
 
 # Phase 3: Hard truncation per message
-_HARD_TRUNCATE_LIMIT = 2500  # final hard limit per message after phases 1&2
+_HARD_TRUNCATE_LIMIT = 5000  # final hard limit per message after phases 1&2
 
 # Priority for Phase 3 trimming (lower = trim first)
 # Tool results are largest and least valuable when old → trim first

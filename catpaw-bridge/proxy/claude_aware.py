@@ -547,48 +547,48 @@ class ClaudeCodeCompactionConfig:
 
     # Tool-specific truncation for Claude Code (larger than defaults)
     TOOL_TRUNCATION = {
-        "Read":          {"head": 800, "tail": 400},   # vs 350+200 — Edit needs exact context
-        "Bash":          {"head": 600, "tail": 200},   # vs 400+0 — error output at bottom matters
+        "Read":          {"head": 2000, "tail": 1000},  # vs 350+200 — Edit needs exact context
+        "Bash":          {"head": 1000, "tail": 200},   # vs 400+0 — error output at bottom matters
         "Write":         {"head": 99999, "tail": 0},    # keep as-is (usually small confirmation)
         "Edit":          {"head": 99999, "tail": 0},    # keep as-is (usually small confirmation)
         "MultiEdit":     {"head": 99999, "tail": 0},    # keep as-is
-        "Grep":          {"head": 500, "tail": 150},    # vs 300+80 — more matches preserved
-        "Glob":          {"head": 400, "tail": 100},    # vs 300+80
-        "codebase_search": {"head": 500, "tail": 150},
-        "WebFetch":       {"head": 600, "tail": 200},   # vs 400+100
-        "WebSearch":      {"head": 600, "tail": 200},
-        "list_dir":       {"head": 300, "tail": 0},
-        "List":           {"head": 300, "tail": 0},
-        "LS":             {"head": 300, "tail": 0},
+        "Grep":          {"head": 600, "tail": 200},    # vs 300+80 — more matches preserved
+        "Glob":          {"head": 500, "tail": 150},    # vs 300+80
+        "codebase_search": {"head": 600, "tail": 200},
+        "WebFetch":       {"head": 800, "tail": 200},   # vs 400+100
+        "WebSearch":      {"head": 800, "tail": 200},
+        "list_dir":       {"head": 400, "tail": 0},
+        "List":           {"head": 400, "tail": 0},
+        "LS":             {"head": 400, "tail": 0},
         "TodoWrite":      {"head": 99999, "tail": 0},   # keep as-is (task state is critical)
-        "Task":           {"head": 600, "tail": 200},   # subagent results
+        "Task":           {"head": 800, "tail": 200},   # subagent results
         "delete_file":    {"head": 99999, "tail": 0},
-        "run_terminal_cmd": {"head": 600, "tail": 0},
+        "run_terminal_cmd": {"head": 1000, "tail": 0},
         "NotebookEdit":   {"head": 99999, "tail": 0},
         "AskUserQuestion": {"head": 99999, "tail": 0},
         # Codex tool names (in case Claude Code is used with Codex tools)
-        "shell":          {"head": 600, "tail": 200},
-        "exec_command":   {"head": 600, "tail": 200},
+        "shell":          {"head": 1000, "tail": 200},
+        "exec_command":   {"head": 1000, "tail": 200},
         "apply_patch":    {"head": 99999, "tail": 0},
-        "read_file":      {"head": 800, "tail": 400},
+        "read_file":      {"head": 2000, "tail": 1000},
         "write_file":     {"head": 99999, "tail": 0},
-        "container_exec": {"head": 600, "tail": 200},
+        "container_exec": {"head": 1000, "tail": 200},
     }
 
     # Keep more recent items for Claude Code (multi-step edits need context)
-    RECENT_TOOL_RESULTS_KEEP = 5     # vs 3 default
-    RECENT_TURNS_KEEP = 5            # vs 3 default
+    RECENT_TOOL_RESULTS_KEEP = 8     # vs 3 default
+    RECENT_TURNS_KEEP = 8            # vs 3 default
 
     # Less aggressive role summarization for Claude Code
     ROLE_SUMMARY_LEN = {
-        "user": 350,       # vs 200 default — user intent is critical
-        "assistant": 200,  # vs 100 default — what the model did
-        "tool": 150,       # vs 80 default — tool name + result summary
+        "user": 500,       # vs 200 default — user intent is critical
+        "assistant": 300,  # vs 100 default — what the model did
+        "tool": 250,       # vs 80 default — tool name + result summary
         "system": 100,
     }
 
     # Larger hard truncate limit for Claude Code
-    HARD_TRUNCATE_LIMIT = 4000  # vs 2500 default
+    HARD_TRUNCATE_LIMIT = 5000  # vs 2500 default
 
 
 # ---------------------------------------------------------------------------

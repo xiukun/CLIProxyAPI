@@ -27,10 +27,10 @@ _SCRIPT_DIR = Path(__file__).resolve().parent.parent  # catpaw-bridge/
 _MEMORY_DIR = _SCRIPT_DIR / ".memory"
 
 # Summarize when conversation has more than this many messages
-_SUMMARY_THRESHOLD = 30  # don't summarize short conversations
+_SUMMARY_THRESHOLD = 60  # don't summarize short conversations
 
 # Keep this many recent messages intact (don't include in summary)
-_KEEP_RECENT = 10
+_KEEP_RECENT = 30
 
 # Max age for memory files (auto-cleanup)
 _MEMORY_TTL = 3600  # 1 hour
@@ -147,18 +147,18 @@ def save_memory(messages: list, conversation_id: str, conv_hash: str = "") -> No
 
         if role == "tool":
             # For tool results, just note what tool was used
-            summary_parts.append(f"[tool result: {content[:100]}...]")
+            summary_parts.append(f"[tool result: {content[:300]}...]")
         elif role == "assistant":
             # For assistant messages, note the content + tool call names
-            text = content[:200] if content else ""
+            text = content[:500] if content else ""
             tool_calls = msg.get("tool_calls", [])
             if tool_calls:
                 tc_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
                 text += f" [called: {', '.join(tc_names)}]"
             summary_parts.append(f"[assistant: {text}]")
         elif role == "user":
-            # For user messages, keep first 150 chars
-            summary_parts.append(f"[user: {content[:150]}]")
+            # For user messages, keep first 400 chars
+            summary_parts.append(f"[user: {content[:400]}]")
         elif role == "system":
             # Skip system messages in summary
             pass

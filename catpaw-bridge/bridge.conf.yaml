@@ -25,12 +25,12 @@ catpaw_proxy:
 limits:
   # CatPawAI 上游对加密请求体有大小限制（约 128KB）
   # 超过此值上游会直接关闭连接，不返回任何 HTTP 响应
-  max_encrypted_body: 180000    # 加密后最大字节数（警告阈值）
+  max_encrypted_body: 250000    # 加密后最大字节数（警告阈值）
   # 系统消息截断阈值（Claude Code 的 system prompt 含完整工具描述，
   # 通常 80-120KB，我们已用紧凑格式注入工具定义，可安全截断）
   max_system_content: 8000      # 系统消息最大字符数
   # 普通消息截断阈值（如 Read 工具返回的大文件内容）
-  max_message_content: 15000    # 非系统消息最大字符数
+  max_message_content: 50000    # 非系统消息最大字符数
 
 # ---- CatPawAI 上游 ----
 catpaw:

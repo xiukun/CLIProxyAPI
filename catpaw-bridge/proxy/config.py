@@ -28,7 +28,7 @@ _DEFAULTS = {
         "need_passport_id": True,
     },
     "model": {"name": "glm-5.2", "type_code": 2},
-    "limits": {"max_encrypted_body": 180_000, "max_message_content": 15_000, "max_system_content": 8_000},
+    "limits": {"max_encrypted_body": 250_000, "max_message_content": 50_000, "max_system_content": 8_000},
 }
 
 
