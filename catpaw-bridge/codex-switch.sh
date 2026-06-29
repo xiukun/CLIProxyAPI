@@ -74,6 +74,34 @@ base_url = "http://${CLIPROXY_HOST}:${CLIPROXY_PORT}"
 wire_api = "$_CODEX_WIRE_API"
 api_key = "${CLIPROXY_API_KEY}"
 TOML
+
+    # Initialize .ccg/ scaffold in the current project directory
+    # This allows the ccg-workflow.py hook to function properly
+    _init_ccg_scaffold
+}
+
+# Initialize .ccg/ directory structure in the current project
+_init_ccg_scaffold() {
+    local project_dir="${PWD}"
+    local ccg_dir="${project_dir}/.ccg"
+
+    if [[ -d "$ccg_dir" ]]; then
+        return 0  # Already exists
+    fi
+
+    mkdir -p "$ccg_dir/tasks/archive" "$ccg_dir/spec/backend" \
+             "$ccg_dir/spec/frontend" "$ccg_dir/spec/guides" \
+             "$ccg_dir/research"
+
+    # Create .gitignore to avoid committing task state
+    cat > "$ccg_dir/.gitignore" << 'EOF'
+# CCG task state - do not commit
+tasks/
+research/
+*.tmp
+EOF
+
+    echo "   CCG scaffold initialized: $ccg_dir"
 }
 
 # 写入 OpenAI 官方配置

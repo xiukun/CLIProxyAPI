@@ -1,19 +1,22 @@
 """CCG Context Loader — CCG skill routing + project context for system prompt.
 
 This module loads CCG (Code Craft Guide) routing rules at startup and
-builds a compact, stable system prompt that includes:
-  1. Role description + initial setup (read CLAUDE.md / AGENTS.md first)
-  2. CCG skill routing rules (domain expertise auto-detection)
-  3. CCG quality gates (auto-trigger after code changes)
-  4. Tool calling rules (format + strict requirements)
+provides context-aware system prompt injection.
+
+Architecture (v2 — Bridge Native CCG Orchestration):
+  1. Static CCG routing rules loaded ONCE at module import (for non-CLI mode)
+  2. Dynamic CCG routing built per-request via get_ccg_routing_for_cli()
+     — detects Codex vs Claude Code
+     — uses correct tool names (read_file vs Read)
+     — uses correct skill paths (~/.codex/skills/ccg vs ~/.claude/skills/ccg)
+  3. Phase-aware lifecycle guidance via ccg_lifecycle.get_ccg_lifecycle_context()
 
 Cache strategy (高缓存):
-  - CCG rules loaded ONCE at module import (files rarely change)
-  - Full system prompt built ONCE at module import and cached
-  - No file I/O on repeated requests — zero per-request overhead
-  - Stable content enables effective memory/compaction in the Bridge
+  - Static rules loaded ONCE at module import
+  - Dynamic routing context built per-request (lightweight, ~100 lines of string ops)
+  - No file I/O on repeated requests — zero per-request overhead for static parts
 
-The generated prompt is ~4KB — compact enough to leave room for
+The generated prompt is ~2-4KB — compact enough to leave room for
 conversation history within the upstream body size limit.
 """
 
@@ -46,66 +49,129 @@ elif VERBOSE:
 
 
 # ---------------------------------------------------------------------------
-# Compact CCG routing rules
-# Extracted from ~/.claude/rules/ccg-skill-routing.md and ccg-skills.md
-# Kept compact (~2KB) to leave room for conversation history
+# CLI-aware CCG routing rules
+# Built dynamically based on detected CLI (Codex vs Claude Code)
 # ---------------------------------------------------------------------------
-_CCG_ROUTING_COMPACT = """## CCG Skill Routing
 
-When the user's request matches trigger keywords, READ the corresponding skill
-file at ~/.claude/skills/ccg/domains/ BEFORE responding. Do NOT fabricate
-domain knowledge when a skill file exists.
+# Skill domain routing table (shared between Codex and Claude Code)
+_DOMAIN_ROUTES = [
+    ("pentest, red team, exploit, OWASP, SQLi, XSS, SSRF", "security/pentest.md"),
+    ("blue team, incident response, forensics, SIEM, EDR", "security/blue-team.md"),
+    ("code audit, taint analysis, dangerous function", "security/code-audit.md"),
+    ("API design, REST, GraphQL, gRPC, versioning", "architecture/api-design.md"),
+    ("caching, Redis, Memcached, CDN, invalidation", "architecture/caching.md"),
+    ("Kubernetes, Docker, microservice, service mesh", "architecture/cloud-native.md"),
+    ("Kafka, RabbitMQ, event driven, pub/sub", "architecture/message-queue.md"),
+    ("RAG, vector database, embedding, chunking", "ai/rag-system.md"),
+    ("AI agent, tool use, function calling, orchestration", "ai/agent-dev.md"),
+    ("LLM security, prompt injection, jailbreak, guardrail", "ai/llm-security.md"),
+    ("prompt engineering, model evaluation, fine-tuning", "ai/prompt-and-eval.md"),
+    ("Git workflow, branching, trunk-based, GitFlow", "devops/git-workflow.md"),
+    ("testing, unit test, integration, e2e, test pyramid", "devops/testing.md"),
+    ("database, migration, schema, indexing, query opt", "devops/database.md"),
+    ("performance, profiling, load test, latency", "devops/performance.md"),
+    ("observability, logging, tracing, metrics, Grafana", "devops/observability.md"),
+]
 
-### Domain Expertise Routing
-| Keywords | Skill File |
-|----------|-----------|
-| pentest, red team, exploit, OWASP, SQLi, XSS, SSRF | domains/security/pentest.md |
-| blue team, incident response, forensics, SIEM, EDR | domains/security/blue-team.md |
-| code audit, taint analysis, dangerous function | domains/security/code-audit.md |
-| API design, REST, GraphQL, gRPC, versioning | domains/architecture/api-design.md |
-| caching, Redis, Memcached, CDN, invalidation | domains/architecture/caching.md |
-| Kubernetes, Docker, microservice, service mesh | domains/architecture/cloud-native.md |
-| Kafka, RabbitMQ, event driven, pub/sub | domains/architecture/message-queue.md |
-| RAG, vector database, embedding, chunking | domains/ai/rag-system.md |
-| AI agent, tool use, function calling, orchestration | domains/ai/agent-dev.md |
-| LLM security, prompt injection, jailbreak, guardrail | domains/ai/llm-security.md |
-| prompt engineering, model evaluation, fine-tuning | domains/ai/prompt-and-eval.md |
-| Git workflow, branching, trunk-based, GitFlow | domains/devops/git-workflow.md |
-| testing, unit test, integration, e2e, test pyramid | domains/devops/testing.md |
-| database, migration, schema, indexing, query opt | domains/devops/database.md |
-| performance, profiling, load test, latency | domains/devops/performance.md |
-| observability, logging, tracing, metrics, Grafana | domains/devops/observability.md |
+_LANGUAGE_ROUTES = [
+    ("Python", ".py", "development/python.md"),
+    ("Go", ".go", "development/go.md"),
+    ("Rust", ".rs", "development/rust.md"),
+    ("TypeScript/JavaScript", ".ts/.js", "development/typescript.md"),
+    ("Java/Kotlin", ".java/.kt", "development/java.md"),
+    ("C/C++", ".c/.cpp/.h", "development/cpp.md"),
+    ("Shell/Bash", ".sh/.bash", "development/shell.md"),
+]
 
-### Language-Specific Routing
-Auto-detect from file extensions, then read the matching skill:
-- Python (.py) → domains/development/python.md
-- Go (.go) → domains/development/go.md
-- Rust (.rs) → domains/development/rust.md
-- TypeScript/JavaScript (.ts/.js) → domains/development/typescript.md
-- Java/Kotlin (.java/.kt) → domains/development/java.md
-- C/C++ (.c/.cpp/.h) → domains/development/cpp.md
-- Shell/Bash (.sh/.bash) → domains/development/shell.md
 
-### Quality Gates (auto-trigger after code changes)
-- New module created → gen-docs → verify-module → verify-security
-- Code changes > 30 lines → verify-change → verify-quality
-- Security-related changes → verify-security
-- Refactoring → verify-change → verify-quality → verify-security
-- Quality gates are non-blocking unless Critical/High severity found
+def _build_ccg_routing_for_cli(is_codex: bool = False, is_claude_code: bool = False) -> str:
+    """Build CCG routing context adapted for the detected CLI.
 
-### Routing Rules
-1. Keyword match is fuzzy — match on intent, not exact string
-2. Multiple matches → read both skill files
-3. Auto-detect language from file extensions or context
-4. Read once per conversation — no need to re-read same skill
-5. Skill files are authoritative over training data
-6. Quality gates chain: skip if previous gate fails"""
+    Key differences from the old static version:
+    1. Uses the correct read tool name (read_file for Codex, Read for Claude Code)
+    2. Uses the correct skill base path (~/.codex/skills/ccg or ~/.claude/skills/ccg)
+    3. Quality gates use the correct write tool name
+
+    Args:
+        is_codex: Whether this is a Codex CLI request
+        is_claude_code: Whether this is a Claude Code request
+
+    Returns:
+        CCG routing context string (~1.5-2KB)
+    """
+    if not _CCG_AVAILABLE:
+        return ""
+
+    # Determine tool names and skill paths
+    if is_codex:
+        read_tool = "read_file"
+        patch_tool = "apply_patch"
+        # Codex can read from ~/.claude/skills/ccg/ via read_file (absolute paths work)
+        skill_base = "~/.claude/skills/ccg/domains"
+    elif is_claude_code:
+        read_tool = "Read"
+        patch_tool = "Write"
+        skill_base = "~/.claude/skills/ccg/domains"
+    else:
+        read_tool = "read_file"
+        patch_tool = "apply_patch"
+        skill_base = "~/.claude/skills/ccg/domains"
+
+    lines = [
+        "## CCG Skill Routing",
+        "",
+        f"When the user's request matches trigger keywords, use {read_tool} to READ the",
+        f"corresponding skill file at {skill_base}/ BEFORE responding.",
+        "Do NOT fabricate domain knowledge when a skill file exists.",
+        "",
+        "### Domain Expertise Routing",
+        "| Keywords | Skill File |",
+        "|----------|-----------|",
+    ]
+
+    for keywords, skill_file in _DOMAIN_ROUTES:
+        lines.append(f"| {keywords} | {skill_base}/{skill_file} |")
+
+    lines.extend([
+        "",
+        "### Language-Specific Routing",
+        "Auto-detect from file extensions, then read the matching skill:",
+    ])
+    for lang, ext, skill_file in _LANGUAGE_ROUTES:
+        lines.append(f"- {lang} ({ext}) → {skill_base}/{skill_file}")
+
+    lines.extend([
+        "",
+        "### Quality Gates (auto-trigger after code changes)",
+        f"- New module created → gen-docs → verify-module → verify-security",
+        f"- Code changes > 30 lines → verify-change → verify-quality",
+        f"- Security-related changes → verify-security",
+        f"- Refactoring → verify-change → verify-quality → verify-security",
+        f"- Quality gates are non-blocking unless Critical/High severity found",
+        "",
+        "### Routing Rules",
+        "1. Keyword match is fuzzy — match on intent, not exact string",
+        "2. Multiple matches → read both skill files",
+        "3. Auto-detect language from file extensions or context",
+        "4. Read once per conversation — no need to re-read same skill",
+        "5. Skill files are authoritative over training data",
+        "6. Quality gates chain: skip if previous gate fails",
+    ])
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Static CCG routing (for non-CLI mode — backward compatible)
+# ---------------------------------------------------------------------------
+
+_CCG_ROUTING_COMPACT = _build_ccg_routing_for_cli(is_codex=False, is_claude_code=False)
 
 
 # ---------------------------------------------------------------------------
 # Initial setup instructions (stable, never changes)
-# Instructs the model to read project context files FIRST
 # ---------------------------------------------------------------------------
+
 _INITIAL_SETUP = """## Initial Setup (FIRST ACTION)
 When starting a new task, FIRST read project context files before responding:
 1. Read CLAUDE.md (or claude.md) in the project root — project rules & conventions
@@ -118,6 +184,7 @@ Then proceed with the user's request."""
 # Tool calling rules (stable, never changes)
 # Adapted for BOTH Claude Code (Read/Write/Edit/Bash) and Codex CLI (shell/exec_command/read_file)
 # ---------------------------------------------------------------------------
+
 _TOOL_CALLING = """## Tool Calling (CRITICAL)
 When you need to use ANY tool (Read, Write, Edit, Bash, shell, exec_command,
 read_file, apply_patch, etc.), output:
@@ -145,7 +212,7 @@ read_file, apply_patch, etc.), output:
 
 
 def get_ccg_routing_context() -> str:
-    """Get the CCG routing context string for system prompt injection.
+    """Get the static CCG routing context string for system prompt injection.
 
     Returns empty string if CCG is not available.
     The result is cached at module load time — no per-request overhead.
@@ -153,6 +220,24 @@ def get_ccg_routing_context() -> str:
     if not _CCG_AVAILABLE:
         return ""
     return _CCG_ROUTING_COMPACT
+
+
+def get_ccg_routing_for_cli(is_codex: bool = False, is_claude_code: bool = False) -> str:
+    """Get CLI-aware CCG routing context.
+
+    This is the v2 version that adapts tool names and skill paths
+    based on the detected CLI (Codex vs Claude Code).
+
+    Args:
+        is_codex: Whether this is a Codex CLI request
+        is_claude_code: Whether this is a Claude Code request
+
+    Returns:
+        CCG routing context string adapted for the CLI, or empty string
+    """
+    if not _CCG_AVAILABLE:
+        return ""
+    return _build_ccg_routing_for_cli(is_codex=is_codex, is_claude_code=is_claude_code)
 
 
 def build_system_prompt() -> str:

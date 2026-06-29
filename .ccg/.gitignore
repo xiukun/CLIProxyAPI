@@ -1,0 +1,4 @@
+# CCG task state - do not commit
+tasks/
+research/
+*.tmp

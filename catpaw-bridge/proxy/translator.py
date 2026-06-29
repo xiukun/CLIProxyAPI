@@ -12,6 +12,7 @@ Key design decisions:
 """
 
 import json
+import os
 import re
 import time
 import uuid
@@ -29,9 +30,11 @@ from proxy.compactor import compact_messages, compact_merged_content
 from proxy.memory import get_summary_prefix, save_memory, _conv_hash
 from proxy.ccg_context import CUSTOM_SYSTEM_PROMPT as _CUSTOM_SYSTEM_PROMPT
 from proxy.ccg_context import get_ccg_routing_context as _get_ccg_routing_context
+from proxy.ccg_context import get_ccg_routing_for_cli as _get_ccg_routing_for_cli
 from proxy.codex_aware import (
     detect_codex,
     extract_codex_instructions,
+    compress_codex_system_prompt,
     build_codex_system_prompt,
     enhance_codex_tools_prompt,
     CodexCompactionConfig,
@@ -43,6 +46,11 @@ from proxy.claude_aware import (
     enhance_claude_code_tools_prompt,
     ClaudeCodeCompactionConfig,
     extract_useful_reminder_context,
+)
+from proxy.ccg_lifecycle import (
+    get_ccg_lifecycle_context,
+    ensure_ccg_scaffold,
+    create_ccg_task,
 )
 
 
@@ -257,9 +265,9 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
     is_codex, codex_system_content = detect_codex(messages, tools)
     codex_instructions = ""
     if is_codex:
-        codex_instructions = extract_codex_instructions(codex_system_content)
+        codex_instructions = compress_codex_system_prompt(codex_system_content)
         if VERBOSE:
-            print(f"[CatPawProxy] Codex mode: extracted {len(codex_instructions)} chars of behavioral instructions", flush=True)
+            print(f"[CatPawProxy] Codex mode: compressed system prompt to {len(codex_instructions)} chars", flush=True)
 
     is_claude_code = False
     claude_code_instructions = ""
@@ -301,15 +309,23 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
             # 3. Build system prompt + tool definitions FIRST, so we know
             #    their size and can pass the overhead to the compactor
             if is_codex:
-                # Codex-aware system prompt: includes extracted behavioral
-                # rules + apply_patch format + CCG routing + tool calling
-                ccg_ctx = _get_ccg_routing_context()
-                system_prompt = build_codex_system_prompt(codex_instructions, ccg_ctx)
+                # Codex-aware system prompt: uses incremental merge — keeps
+                # original Codex prompt structure + appends Bridge supplements
+                ccg_ctx = _get_ccg_routing_for_cli(is_codex=True, is_claude_code=False)
+                lifecycle_ctx = get_ccg_lifecycle_context(messages, is_codex=True)
+                system_prompt = build_codex_system_prompt(
+                    codex_instructions, ccg_ctx, lifecycle_context=lifecycle_ctx
+                )
+                # Ensure .ccg/ scaffold exists so the Codex hook can function
+                _project_dir = os.environ.get("CODEX_PROJECT_DIR", os.getcwd())
+                ensure_ccg_scaffold(_project_dir)
             elif is_claude_code:
-                # Claude Code-aware system prompt: includes extracted behavioral
-                # rules + CCG routing + tool calling
-                ccg_ctx = _get_ccg_routing_context()
-                system_prompt = build_claude_code_system_prompt(claude_code_instructions, ccg_ctx)
+                # Claude Code-aware system prompt: uses incremental merge
+                ccg_ctx = _get_ccg_routing_for_cli(is_codex=False, is_claude_code=True)
+                lifecycle_ctx = get_ccg_lifecycle_context(messages, is_claude_code=True)
+                system_prompt = build_claude_code_system_prompt(
+                    claude_code_instructions, ccg_ctx, lifecycle_context=lifecycle_ctx
+                )
             else:
                 # Non-CLI: use the original cached system prompt
                 system_prompt = _CUSTOM_SYSTEM_PROMPT

@@ -5,19 +5,24 @@ Detects Codex CLI requests and provides Codex-specific enhancements:
   2. Injects apply_patch format documentation
   3. Enhances tool definitions with parameter details
   4. Tunes compaction to be less aggressive for Codex workflows
+  5. Incremental merge: appends Bridge supplements to the original prompt
+     instead of extracting + rebuilding (preserves Codex's prompt structure)
 
-Architecture:
+Architecture (v2 — Incremental Merge):
   - detect_codex() is called early in the request pipeline
-  - The CodexContext is passed through to translator/toolcall/compactor
+  - build_codex_system_prompt() now does INCREMENTAL MERGE:
+    * Keeps the original Codex system prompt (compressed, not extracted)
+    * Appends apply_patch format + CCG routing + tool calling as supplements
+    * Preserves Codex's original instruction structure and priority
   - Non-Codex requests are completely unaffected (zero overhead)
 
 Why this matters:
   Codex CLI sends a ~15KB system prompt with critical behavioral rules
-  (how to use apply_patch, when to verify changes, conciseness rules, etc.)
-  The bridge previously DROPPED this entirely, replacing it with a generic
-  4KB prompt. This caused the model to lose Codex-specific behaviors,
-  resulting in failed patches, over-verbose responses, and missing
-  verification steps.
+  (how to use apply_patch, when to verify changes, conciseness rules, etc.).
+  The v1 approach extracted behavioral lines and rebuilt the prompt from
+  scratch, losing the original structure and priority. The v2 approach
+  keeps the original prompt (compressed via noise stripping) and appends
+  Bridge-specific supplements at the end.
 """
 
 import re
@@ -201,93 +206,85 @@ _BEHAVIORAL_LINE_PREFIXES = (
 )
 
 
-def extract_codex_instructions(system_content: str) -> str:
-    """Extract key behavioral instructions from Codex system prompt.
+def compress_codex_system_prompt(system_content: str) -> str:
+    """Compress Codex system prompt by stripping noise, keeping structure.
 
-    The Codex system prompt is ~15KB. We extract behavioral rules and
-    compress them to ~2KB, focusing on the rules that affect code quality.
+    v2 approach: Instead of extracting behavioral lines and rebuilding,
+    we strip noise sections (environment, repo layout) and truncate to
+    a budget. This preserves the original prompt's structure, priority,
+    and formatting — the model sees the same instructions Codex intended,
+    just smaller.
 
     Args:
-        system_content: Full Codex system prompt text
+        system_content: Full Codex system prompt text (~15KB)
 
     Returns:
-        Compact behavioral instructions (~2KB)
+        Compressed system prompt (~3-4KB), structure preserved
     """
     if not system_content or len(system_content) < 100:
         return ""
 
     # Strip noise sections (environment, repo layout, user instructions)
-    # These are dynamic and not useful as behavioral rules
     cleaned = _RE_CODEX_NOISE.sub('', system_content)
 
-    # If the prompt is already small enough (< 4KB), keep it as-is
-    if len(cleaned) < 4000:
+    # Remove excessive blank lines (3+ consecutive → 2)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+
+    # If small enough, keep as-is
+    if len(cleaned) <= 4000:
         return cleaned.strip()
 
-    # For larger prompts, extract behavioral lines
-    lines = cleaned.split('\n')
-    kept_lines = []
-    in_section = False
+    # For larger prompts: keep the beginning (role + core rules) and end (tool rules)
+    # The beginning has the role definition and core behavioral rules.
+    # The end often has tool usage instructions.
+    # The middle has verbose examples and edge cases we can trim.
+    target_size = 3500
+    head_size = int(target_size * 0.65)  # 65% from the beginning
+    tail_size = target_size - head_size - 80  # 35% from the end, minus marker
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if in_section and kept_lines and kept_lines[-1]:
-                kept_lines.append("")  # preserve paragraph breaks
-            continue
+    head = cleaned[:head_size]
+    tail = cleaned[-tail_size:]
 
-        # Keep section headers (## or ###)
-        if stripped.startswith('#'):
-            kept_lines.append(stripped)
-            in_section = True
-            continue
+    # Try to cut at a line boundary to avoid breaking mid-sentence
+    last_newline = head.rfind('\n')
+    if last_newline > head_size * 0.5:
+        head = head[:last_newline]
 
-        # Keep behavioral rule lines
-        if stripped.startswith(_BEHAVIORAL_LINE_PREFIXES):
-            kept_lines.append(stripped)
-            in_section = True
-            continue
+    first_newline = tail.find('\n')
+    if first_newline != -1:
+        tail = tail[first_newline + 1:]
 
-        # Keep lines that look like instructions (imperative mood)
-        if re.match(r'^[A-Z][a-z]+ ', stripped) and len(stripped) < 200:
-            kept_lines.append(stripped)
-            in_section = True
-            continue
+    result = head + "\n\n... [middle section trimmed for brevity] ...\n\n" + tail
+    return result.strip()
 
-        in_section = False
 
-    # Clean up trailing empty lines
-    while kept_lines and not kept_lines[-1]:
-        kept_lines.pop()
-
-    result = '\n'.join(kept_lines)
-
-    # Cap at 3KB to leave room for other prompt components
-    if len(result) > 3000:
-        result = result[:2950] + "\n... [additional rules truncated]"
-
-    return result
+# Backward compatibility alias
+extract_codex_instructions = compress_codex_system_prompt
 
 
 # ---------------------------------------------------------------------------
 # Codex-aware system prompt builder
 # ---------------------------------------------------------------------------
 
-def build_codex_system_prompt(codex_instructions: str, ccg_context: str = "") -> str:
-    """Build a Codex-aware system prompt.
+def build_codex_system_prompt(codex_instructions: str, ccg_context: str = "",
+                              lifecycle_context: str = "") -> str:
+    """Build a Codex-aware system prompt using incremental merge.
 
-    Structure:
-      1. Bridge role description
-      2. Codex behavioral rules (from extracted instructions)
-      3. apply_patch format documentation
-      4. CCG routing rules (if available)
-      5. Tool calling format
+    v2 Architecture — Incremental Merge:
+      1. Bridge role header (compact, 3 lines)
+      2. Original Codex system prompt (compressed, structure preserved)
+         — OR default behavioral rules if no system prompt was provided
+      3. apply_patch format documentation (Bridge supplement)
+      4. CCG routing rules (if available, CLI-aware)
+      5. CCG lifecycle guidance (phase-aware, from conversation analysis)
+      6. Tool calling format (Bridge supplement)
 
-    Total size: ~4-6KB (vs 4KB for non-Codex prompt)
+    Total size: ~5-8KB (original prompt compressed + supplements)
 
     Args:
-        codex_instructions: Extracted Codex behavioral instructions
+        codex_instructions: Compressed Codex system prompt (from compress_codex_system_prompt)
         ccg_context: CCG routing context string (empty if not available)
+        lifecycle_context: Phase-aware CCG lifecycle guidance (empty if not applicable)
 
     Returns:
         Complete system prompt string
@@ -298,21 +295,27 @@ def build_codex_system_prompt(codex_instructions: str, ccg_context: str = "") ->
         "Communicate in the user's language, keep technical terms in English.",
     ]
 
-    # Codex behavioral rules (extracted from original system prompt)
+    # Original Codex system prompt (compressed, structure preserved)
+    # This is the KEY change from v1: we keep the original prompt structure
+    # rather than extracting and rebuilding from scratch.
     if codex_instructions:
-        parts.append("## Extracted Instructions\n" + codex_instructions)
+        parts.append(codex_instructions)
     else:
         # No system prompt was provided — use default behavioral rules
         parts.append(_CODEX_BEHAVIORAL_RULES)
 
-    # apply_patch format (critical for Codex)
+    # apply_patch format (critical for Codex — Bridge supplement)
     parts.append(_APPLY_PATCH_FORMAT)
 
-    # CCG routing rules (if available)
+    # CCG routing rules (if available, CLI-aware)
     if ccg_context:
         parts.append(ccg_context)
 
-    # Tool calling format (always present)
+    # CCG lifecycle guidance (phase-aware, dynamic)
+    if lifecycle_context:
+        parts.append(lifecycle_context)
+
+    # Tool calling format (always present — Bridge supplement)
     parts.append(_CODEX_TOOL_CALLING)
 
     return "\n\n".join(parts)

@@ -282,16 +282,17 @@ _BEHAVIORAL_LINE_PREFIXES = (
 
 
 def extract_claude_code_instructions(system_content: str) -> str:
-    """Extract key behavioral instructions from Claude Code system prompt.
+    """Compress Claude Code system prompt by stripping noise, keeping structure.
 
-    The Claude Code system prompt is ~100KB+. We extract behavioral rules and
-    compress them to ~3KB, focusing on the rules that affect code quality.
+    v2 approach: Instead of extracting behavioral lines and rebuilding,
+    we strip noise sections and truncate to a budget. This preserves the
+    original prompt's structure, priority, and formatting.
 
     Args:
-        system_content: Full Claude Code system prompt text
+        system_content: Full Claude Code system prompt text (~100KB+)
 
     Returns:
-        Compact behavioral instructions (~3KB)
+        Compressed system prompt (~3-4KB), structure preserved
     """
     if not system_content or len(system_content) < 100:
         return ""
@@ -299,53 +300,32 @@ def extract_claude_code_instructions(system_content: str) -> str:
     # Strip noise sections
     cleaned = _RE_CLAUDE_CODE_NOISE.sub('', system_content)
 
-    # If the prompt is already small enough (< 5KB), keep it as-is
-    if len(cleaned) < 5000:
+    # Remove excessive blank lines (3+ consecutive -> 2)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+
+    # If small enough, keep as-is
+    if len(cleaned) <= 4000:
         return cleaned.strip()
 
-    # For larger prompts, extract behavioral lines
-    lines = cleaned.split('\n')
-    kept_lines = []
-    in_section = False
+    # For larger prompts: keep the beginning (role + core rules) and end (tool rules)
+    target_size = 3500
+    head_size = int(target_size * 0.65)
+    tail_size = target_size - head_size - 80
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if in_section and kept_lines and kept_lines[-1]:
-                kept_lines.append("")  # preserve paragraph breaks
-            continue
+    head = cleaned[:head_size]
+    tail = cleaned[-tail_size:]
 
-        # Keep section headers (# or ##)
-        if stripped.startswith('#'):
-            kept_lines.append(stripped)
-            in_section = True
-            continue
+    # Cut at line boundaries
+    last_newline = head.rfind('\n')
+    if last_newline > head_size * 0.5:
+        head = head[:last_newline]
 
-        # Keep behavioral rule lines
-        if stripped.startswith(_BEHAVIORAL_LINE_PREFIXES):
-            kept_lines.append(stripped)
-            in_section = True
-            continue
+    first_newline = tail.find('\n')
+    if first_newline != -1:
+        tail = tail[first_newline + 1:]
 
-        # Keep lines that look like instructions (imperative mood)
-        if re.match(r'^[A-Z][a-z]+ ', stripped) and len(stripped) < 200:
-            kept_lines.append(stripped)
-            in_section = True
-            continue
-
-        in_section = False
-
-    # Clean up trailing empty lines
-    while kept_lines and not kept_lines[-1]:
-        kept_lines.pop()
-
-    result = '\n'.join(kept_lines)
-
-    # Cap at 3KB to leave room for other prompt components
-    if len(result) > 3000:
-        result = result[:2950] + "\n... [additional rules truncated]"
-
-    return result
+    result = head + "\n\n... [middle section trimmed for brevity] ...\n\n" + tail
+    return result.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -383,21 +363,25 @@ TodoWrite, shell, etc.), output:
 - Example: <tool_call>{"name":"TodoWrite","arguments":{"todos":[{"id":"1","content":"Fix bug","status":"in_progress","activeForm":"Fixing bug"}]}}</tool_call>"""
 
 
-def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str = "") -> str:
-    """Build a Claude Code-aware system prompt.
+def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str = "",
+                              lifecycle_context: str = "") -> str:
+    """Build a Claude Code-aware system prompt using incremental merge.
 
-    Structure:
-      1. Bridge role description
-      2. Claude Code behavioral rules (from extracted instructions or defaults)
+    v2 Architecture — Incremental Merge:
+      1. Bridge role header (compact)
+      2. Original Claude Code system prompt (compressed, structure preserved)
+         — OR default behavioral rules if no system prompt was provided
       3. Tool format reference (Edit exact match, Read line numbers, etc.)
-      4. CCG routing rules (if available)
-      5. Tool calling format
+      4. CCG routing rules (if available, CLI-aware)
+      5. CCG lifecycle guidance (phase-aware, from conversation analysis)
+      6. Tool calling format
 
-    Total size: ~5-7KB (vs 4KB for generic prompt)
+    Total size: ~6-9KB (original prompt compressed + supplements)
 
     Args:
-        claude_instructions: Extracted Claude Code behavioral instructions
+        claude_instructions: Compressed Claude Code system prompt
         ccg_context: CCG routing context string (empty if not available)
+        lifecycle_context: Phase-aware CCG lifecycle guidance (empty if not applicable)
 
     Returns:
         Complete system prompt string
@@ -408,9 +392,9 @@ def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str =
         "Communicate in the user's language, keep technical terms in English.",
     ]
 
-    # Claude Code behavioral rules (extracted from original system prompt)
+    # Original Claude Code system prompt (compressed, structure preserved)
     if claude_instructions:
-        parts.append("## Extracted Instructions\n" + claude_instructions)
+        parts.append(claude_instructions)
     else:
         # No system prompt was provided — use default behavioral rules
         parts.append(_CLAUDE_CODE_BEHAVIORAL_RULES)
@@ -418,9 +402,13 @@ def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str =
     # Tool format reference (critical for Claude Code tools)
     parts.append(_CLAUDE_CODE_TOOL_FORMATS)
 
-    # CCG routing rules (if available)
+    # CCG routing rules (if available, CLI-aware)
     if ccg_context:
         parts.append(ccg_context)
+
+    # CCG lifecycle guidance (phase-aware, dynamic)
+    if lifecycle_context:
+        parts.append(lifecycle_context)
 
     # Tool calling format (always present)
     parts.append(_CLAUDE_CODE_TOOL_CALLING)
