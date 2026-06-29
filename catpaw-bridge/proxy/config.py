@@ -93,7 +93,7 @@ def _load_config() -> dict:
         "max_encrypted_body": int(limits.get("max_encrypted_body", 180_000)),
         "max_message_content": int(limits.get("max_message_content", 50_000)),
         "max_system_content": int(limits.get("max_system_content", 8_000)),
-        "ccg_enabled": _parse_bool(os.environ.get("CCG_ENABLED"), ccg.get("enabled", True)),
+        "ccg_enabled": _parse_bool(os.environ.get("CCG_ENABLED"), ccg.get("enabled", False)),
     }
 
 

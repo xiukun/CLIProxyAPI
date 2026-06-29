@@ -26,7 +26,7 @@ import re
 from pathlib import Path
 from datetime import datetime
 
-from proxy.config import VERBOSE
+from proxy.config import VERBOSE, CCG_ENABLED
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +216,8 @@ def ensure_ccg_scaffold(project_dir: str) -> bool:
     Returns:
         True if scaffold was created (or already existed), False on error
     """
+    if not CCG_ENABLED:
+        return False
     if not project_dir:
         return False
 
@@ -337,6 +339,8 @@ def get_ccg_lifecycle_context(messages: list, is_codex: bool = False, is_claude_
     Returns:
         Compact CCG lifecycle guidance string (~500-1500 chars)
     """
+    if not CCG_ENABLED:
+        return ""
     tool_calls = _extract_tool_calls_from_messages(messages)
     changed_files = _detect_changed_files(tool_calls)
     phase = _detect_phase(tool_calls, changed_files)

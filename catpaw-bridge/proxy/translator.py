@@ -17,7 +17,7 @@ import re
 import time
 import uuid
 
-from proxy.config import MODEL_TYPE_CODE, MAX_MESSAGE_CONTENT, MAX_ENCRYPTED_BODY, STRIP_TOOL_DEFINITIONS, VERBOSE
+from proxy.config import MODEL_TYPE_CODE, MAX_MESSAGE_CONTENT, MAX_ENCRYPTED_BODY, STRIP_TOOL_DEFINITIONS, VERBOSE, CCG_ENABLED
 from proxy.session import get_or_create_conversation_id
 from proxy.toolcall import (
     _inject_tools_prompt,
@@ -311,18 +311,19 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
             if is_codex:
                 # Codex-aware system prompt: uses incremental merge — keeps
                 # original Codex prompt structure + appends Bridge supplements
-                ccg_ctx = _get_ccg_routing_for_cli(is_codex=True, is_claude_code=False)
-                lifecycle_ctx = get_ccg_lifecycle_context(messages, is_codex=True)
+                ccg_ctx = _get_ccg_routing_for_cli(is_codex=True, is_claude_code=False) if CCG_ENABLED else ""
+                lifecycle_ctx = get_ccg_lifecycle_context(messages, is_codex=True) if CCG_ENABLED else ""
                 system_prompt = build_codex_system_prompt(
                     codex_instructions, ccg_ctx, lifecycle_context=lifecycle_ctx
                 )
                 # Ensure .ccg/ scaffold exists so the Codex hook can function
-                _project_dir = os.environ.get("CODEX_PROJECT_DIR", os.getcwd())
-                ensure_ccg_scaffold(_project_dir)
+                if CCG_ENABLED:
+                    _project_dir = os.environ.get("CODEX_PROJECT_DIR", os.getcwd())
+                    ensure_ccg_scaffold(_project_dir)
             elif is_claude_code:
                 # Claude Code-aware system prompt: uses incremental merge
-                ccg_ctx = _get_ccg_routing_for_cli(is_codex=False, is_claude_code=True)
-                lifecycle_ctx = get_ccg_lifecycle_context(messages, is_claude_code=True)
+                ccg_ctx = _get_ccg_routing_for_cli(is_codex=False, is_claude_code=True) if CCG_ENABLED else ""
+                lifecycle_ctx = get_ccg_lifecycle_context(messages, is_claude_code=True) if CCG_ENABLED else ""
                 system_prompt = build_claude_code_system_prompt(
                     claude_code_instructions, ccg_ctx, lifecycle_context=lifecycle_ctx
                 )
