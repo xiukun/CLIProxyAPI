@@ -332,6 +332,8 @@ Read, Write, Edit, Bash, etc.), output:
 - Output ONE tool call at a time, then WAIT for the result.
 - Do NOT output multiple tool calls in one response.
 - Do NOT describe what you will do — just call the tool directly.
+- Do NOT simulate or predict tool results in your output — wait for the actual result.
+- Do NOT include "Tool Result:" text in your response — the system provides results.
 - For read_file/Read: always read BEFORE editing.
 - For apply_patch: use the exact format documented above.
 - Results arrive as 'Tool Result: ...'

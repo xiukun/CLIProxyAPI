@@ -105,6 +105,41 @@ _AGENT_ORPHAN_TAGS = [
 # Also matches other circle characters: ○ ● ⭕ ⚪ 🔴
 _RE_AGENT_STATUS = re.compile(r'[◯○●⭕⚪🔴]\s*[^\n]*\n?', re.DOTALL)
 
+# ---------------------------------------------------------------------------
+# Codex CLI tool result metadata patterns
+# ---------------------------------------------------------------------------
+# Codex CLI wraps tool results with internal debugging metadata:
+#   Chunk ID: 382ad3
+#   Wall time:: 0.0000 seconds
+#   Process failed (exit code 1)
+#   Original token comm: 0
+#   Output:
+#   <actual content>
+# This metadata leaks into model context and causes the model to echo it
+# in its output, creating display pollution.
+
+# Individual Codex CLI metadata line patterns (matched at start of line)
+_RE_CODEX_METADATA_LINES = re.compile(
+    r'^(?:Chunk ID:\s*\w+'
+    r'|Wall time::?\s*[\d.]+\s*seconds'
+    r'|Process\s+(?:failed|exited)\s+(?:\(exit code\s*\d+\)|with code\s*\d+)'
+    r'|Original token\w*::?\s*\d+)'
+    r'\s*$\n?',
+    re.MULTILINE
+)
+
+# "Output:" separator line — content after this is the actual tool output
+_RE_CODEX_OUTPUT_SEPARATOR = re.compile(r'^Output:\s*\n', re.MULTILINE)
+
+# Simulated "Tool Result:" at start of a line — the model hallucinates tool
+# execution output instead of waiting for the actual result.
+# Match at start of line to avoid matching in-sentence references like
+# "The Tool Result shows that..."
+_RE_SIMULATED_TOOL_RESULT = re.compile(
+    r'(?:^|\n)[ \t]*Tool Result:.*',
+    re.DOTALL
+)
+
 # Max chars to scan after JSON for a closing tag (replaces magic numbers 50 and 10)
 _CLOSE_TAG_SCAN_WINDOW = 100
 
@@ -1370,6 +1405,7 @@ def _parse_tool_calls(content: str) -> tuple:
         clean_text = _strip_agent_xml(clean_text)
         # Also strip any remaining <tool_call> tags from clean_text
         clean_text = re.sub(r'</?tool_call>', '', clean_text).strip()
+        clean_text = _clean_model_output_text(clean_text)
         return clean_text, tool_calls
 
     # Format 3: <function_calls><invoke name="..."><parameter>...</parameter></invoke></function_calls>
@@ -1401,6 +1437,7 @@ def _parse_tool_calls(content: str) -> tuple:
         if tool_calls:
             text_parts.append(content[fc_match.end():])
             clean_text = "".join(text_parts).strip()
+            clean_text = _clean_model_output_text(clean_text)
             return clean_text, tool_calls
 
     # Format 4: Markdown JSON code blocks with tool call objects
@@ -1423,6 +1460,7 @@ def _parse_tool_calls(content: str) -> tuple:
     if tool_calls:
         text_parts.append(content[last_end:])
         clean_text = "".join(text_parts).strip()
+        clean_text = _clean_model_output_text(clean_text)
         return clean_text, tool_calls
 
     # Format 5: Markdown code blocks with filename (model's common Write pattern)
@@ -1474,6 +1512,7 @@ def _parse_tool_calls(content: str) -> tuple:
         clean_text = _strip_agent_xml(clean_text)
         if VERBOSE:
             print(f"[CatPawProxy] Parsed {len(tool_calls)} markdown-file-block(s) as Write calls: {[tc['function']['arguments'][:60] for tc in tool_calls]}", flush=True)
+        clean_text = _clean_model_output_text(clean_text)
         return clean_text, tool_calls
 
     # Format 6: Bare JSON tool call (no tags at all)
@@ -1489,6 +1528,7 @@ def _parse_tool_calls(content: str) -> tuple:
         clean_text = _RE_AGENT_STATUS.sub('', clean_text).strip()
         if VERBOSE:
             print(f"[CatPawProxy] Parsed bare-JSON tool call: {tc['function']['name']}", flush=True)
+        clean_text = _clean_model_output_text(clean_text)
         return clean_text, [tc]
 
     # Format 7: Bare ToolName<parameters>{...}</parameters> (no <tool_call> wrapping)
@@ -1506,16 +1546,18 @@ def _parse_tool_calls(content: str) -> tuple:
             clean_text = _strip_agent_xml(clean_text)
             clean_text = re.sub(r'</?tool_call>', '', clean_text).strip()
             clean_text = _RE_AGENT_STATUS.sub('', clean_text).strip()
-            if VERBOSE:
-                print(f"[CatPawProxy] Parsed bare parameters-tag tool call: {tc['function']['name']}", flush=True)
-            return clean_text, [tc]
+        if VERBOSE:
+            print(f"[CatPawProxy] Parsed bare parameters-tag tool call: {tc['function']['name']}", flush=True)
+        clean_text = _clean_model_output_text(clean_text)
+        return clean_text, [tc]
 
-    # No tool calls found — still strip agent XML artifacts from content
+    # No tool calls found
     # Also strip <tool_call> tags that failed to parse
     content = _strip_agent_xml(content)
     content = re.sub(r'</?tool_call>', '', content)
     # Strip any remaining ◯ status lines
     content = _RE_AGENT_STATUS.sub('', content)
+    content = _clean_model_output_text(content)
     return content.strip(), []
 
 
@@ -1692,6 +1734,8 @@ def _convert_messages_with_tools(messages: list) -> str:
         if role == "tool":
             # Tool result message
             content = _extract_text_content(msg.get("content", ""))
+            # Sanitize Codex CLI internal metadata (Chunk ID, Wall time, etc.)
+            content = _sanitize_tool_result_content(content)
             parts.append(f"Tool Result: {content}")
             continue
 
@@ -1767,3 +1811,114 @@ def _strip_agent_xml(content: str) -> str:
     content = _RE_AGENT_STATUS.sub('', content)
 
     return content
+
+
+# ---------------------------------------------------------------------------
+# Tool result sanitization — strip Codex CLI internal metadata
+# ---------------------------------------------------------------------------
+
+def _sanitize_tool_result_content(content: str) -> str:
+    """Strip Codex CLI internal debugging metadata from tool result content.
+
+    Codex CLI wraps tool results with internal metadata:
+        Chunk ID: 382ad3
+        Wall time:: 0.0000 seconds
+        Process failed (exit code 1)
+        Original token comm: 0
+        Output:
+        <actual content>
+
+    This metadata leaks into model context and causes the model to echo it
+    in its output, creating display pollution. We strip it to keep only
+    the actual content.
+
+    Returns the cleaned content, or a placeholder if no actual content
+    remains after stripping.
+    """
+    if not content or len(content) < 20:
+        return content
+
+    # Quick check: if no metadata markers, skip entirely
+    if 'Chunk ID:' not in content and 'Wall time:' not in content:
+        return content
+
+    original_len = len(content)
+
+    # Strategy 1: Find "Output:" separator and take everything after it
+    # This is the cleanest approach — Output: marks the start of actual content
+    output_match = _RE_CODEX_OUTPUT_SEPARATOR.search(content)
+    if output_match:
+        actual = content[output_match.end():]
+        if actual.strip():
+            if VERBOSE:
+                print(f"[CatPawProxy] Sanitized tool result: stripped {original_len - len(actual)} chars of Codex metadata", flush=True)
+            return actual.strip()
+        # Output: exists but nothing after it — process failed with no output
+        if VERBOSE:
+            print(f"[CatPawProxy] Sanitized tool result: no output after metadata", flush=True)
+        return "[Process completed, no output]"
+
+    # Strategy 2: Strip individual metadata lines
+    cleaned = _RE_CODEX_METADATA_LINES.sub('', content)
+    cleaned = cleaned.strip()
+
+    if not cleaned:
+        if VERBOSE:
+            print(f"[CatPawProxy] Sanitized tool result: all content was metadata", flush=True)
+        return "[Process completed, no output]"
+
+    if len(cleaned) < original_len and VERBOSE:
+        print(f"[CatPawProxy] Sanitized tool result: stripped {original_len - len(cleaned)} chars of Codex metadata", flush=True)
+
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Model output cleaning — strip simulated tool results and residual bare JSON
+# ---------------------------------------------------------------------------
+
+def _clean_model_output_text(text: str) -> str:
+    """Clean model output text by removing simulated tool results and bare JSON.
+
+    After _parse_tool_calls extracts the first tool call, the remaining text
+    (clean_text) may contain:
+    1. Simulated "Tool Result:" blocks — the model hallucinates tool execution
+       output instead of waiting for the actual result
+    2. Residual bare JSON tool calls — additional {"name":"...","arguments":...}
+       objects that weren't the first tool call
+    3. Status narratives like "已读取 N 个文件" that add noise
+
+    This function strips all of these to produce clean display text.
+    """
+    if not text:
+        return text
+
+    # Strip <tool_call>...</tool_call> blocks first (entire block including
+    # content). This must happen BEFORE bare JSON detection so that JSON
+    # inside remaining <tool_call> tags doesn't survive as bare JSON.
+    text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
+    # Also strip orphaned <tool_call> or </tool_call> tags (no matching pair)
+    text = re.sub(r'</?tool_call>', '', text).strip()
+
+    # Strip residual bare JSON tool calls (any that were inside <tool_call>
+    # tags are now bare after tag removal above)
+    bare_tc = _find_bare_json_tool_call(text)
+    while bare_tc:
+        tc, start, end = bare_tc
+        text = (text[:start] + text[end:]).strip()
+        bare_tc = _find_bare_json_tool_call(text)
+
+    # Strip simulated "Tool Result:" blocks — everything from "Tool Result:"
+    # at start of a line to the end of text. The model should NEVER output
+    # "Tool Result:" — it should wait for the actual result from the CLI.
+    tool_result_match = _RE_SIMULATED_TOOL_RESULT.search(text)
+    if tool_result_match:
+        text = text[:tool_result_match.start()].rstrip()
+
+    # Strip status narratives (Chinese: "已读取 N 个文件")
+    text = re.sub(r'^已读取\s*\d+\s*个文件\s*\n?', '', text, flags=re.MULTILINE)
+
+    # Clean up excessive whitespace left by removals
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+
+    return text

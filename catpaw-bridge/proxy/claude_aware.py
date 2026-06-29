@@ -344,6 +344,8 @@ TodoWrite, shell, etc.), output:
 - Do NOT output multiple tool calls in one response.
 - Do NOT describe what you will do — just call the tool directly.
 - Do NOT use a colon before tool calls. Use a period.
+- Do NOT simulate or predict tool results in your output — wait for the actual result.
+- Do NOT include "Tool Result:" text in your response — the system provides results.
 - For Read: always Read the file BEFORE editing it.
 - For Edit: use the EXACT text from the Read result as old_string. Match whitespace precisely.
 - For Write: provide the COMPLETE file content.
