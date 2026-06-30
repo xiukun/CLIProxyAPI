@@ -180,6 +180,10 @@ def _truncate_tool_result(content: str, tool_name: str, tool_truncation: dict = 
     Returns the (possibly truncated) content.
     If content is small enough, returns it unchanged.
 
+    For Read/read_file results, the truncation marker includes line number
+    ranges so the model knows which lines were omitted. This helps the model
+    re-read the omitted section with offset/limit if it needs to edit there.
+
     Args:
         tool_truncation: override truncation table (for Codex-aware compaction)
     """
@@ -202,12 +206,45 @@ def _truncate_tool_result(content: str, tool_name: str, tool_truncation: dict = 
         head_part = content[:head]
         tail_part = content[-tail:]
         skipped = len(content) - head - tail
-        return f"{head_part}\n\n... [compacted: {skipped} chars omitted] ...\n\n{tail_part}"
+
+        # For Read/read_file results, include line number range in the marker
+        # so the model knows which lines were omitted and can re-read them.
+        if tool_name in ("Read", "read_file"):
+            head_lines = head_part.count('\n')
+            # Calculate the line number where tail_part begins
+            # total_newlines_in_content minus newlines_in_tail gives the
+            # last newline before tail_part; +1 = first line of tail_part
+            total_newlines = content.count('\n')
+            tail_newlines = tail_part.count('\n')
+            tail_first_line = total_newlines - tail_newlines + 1
+            omitted_lines = tail_first_line - head_lines - 1
+            if omitted_lines > 0:
+                marker = (f"\n\n... [lines {head_lines + 1}-{tail_first_line - 1} omitted, "
+                          f"{omitted_lines} lines, {skipped} chars] ...\n\n")
+            else:
+                # Omitted section is within a single line (partial line)
+                marker = f"\n\n... [partial line omitted, {skipped} chars] ...\n\n"
+        else:
+            marker = f"\n\n... [compacted: {skipped} chars omitted] ...\n\n"
+
+        return f"{head_part}{marker}{tail_part}"
     else:
         # Head only
         head_part = content[:head]
         skipped = len(content) - head
-        return f"{head_part}\n... [compacted: {skipped} chars omitted] ..."
+
+        # For Read/read_file results, include line number range
+        if tool_name in ("Read", "read_file"):
+            head_lines = head_part.count('\n')
+            # Total lines = newlines + 1 if content doesn't end with newline
+            total_lines = content.count('\n')
+            if not content.endswith('\n'):
+                total_lines += 1
+            marker = f"\n... [lines {head_lines + 1}-{total_lines} omitted, {skipped} chars] ..."
+        else:
+            marker = f"\n... [compacted: {skipped} chars omitted] ..."
+
+        return f"{head_part}{marker}"
 
 
 def compact_messages(messages: list, max_encrypted_body: int, overhead: int = 0, codex_config=None) -> list:
@@ -283,6 +320,10 @@ def _find_edit_paired_reads(messages: list, tool_call_id_map: dict) -> set:
     context for old_string. Compressing the Read result would break the Edit.
     This function identifies such protected Read results.
 
+    Enhanced: protects ALL Read results within the same turn as an Edit,
+    not just the single most recent Read. This handles multi-step workflows
+    where the model reads multiple files before editing.
+
     Args:
         messages: message list
         tool_call_id_map: mapping of tool_call_id → tool_name
@@ -291,7 +332,7 @@ def _find_edit_paired_reads(messages: list, tool_call_id_map: dict) -> set:
         Set of message indices that are Read results paired with a subsequent Edit.
     """
     protected = set()
-    # Find all Edit/MultiEdit tool calls (assistant messages with tool_calls)
+    # Find all Edit/MultiEdit/apply_patch tool calls (assistant messages with tool_calls)
     for i, msg in enumerate(messages):
         if msg.get("role") != "assistant":
             continue
@@ -299,21 +340,25 @@ def _find_edit_paired_reads(messages: list, tool_call_id_map: dict) -> set:
         has_edit = False
         for tc in tool_calls:
             tc_name = tc.get("function", {}).get("name", "")
-            if tc_name in ("Edit", "MultiEdit"):
+            if tc_name in ("Edit", "MultiEdit", "apply_patch"):
                 has_edit = True
                 break
         if not has_edit:
             continue
 
-        # Find the most recent Read tool result before this Edit
+        # Walk backwards from the Edit to the start of the current turn
+        # (i.e., until we hit a user message), protecting ALL Read results
+        # in the same turn — not just the most recent one.
         for j in range(i - 1, -1, -1):
             prev_msg = messages[j]
+            if prev_msg.get("role") == "user":
+                break  # Reached the start of the current turn
             if prev_msg.get("role") == "tool":
                 tc_id = prev_msg.get("tool_call_id", "")
                 tool_name = tool_call_id_map.get(tc_id, "")
-                if tool_name == "Read":
+                if tool_name in ("Read", "read_file"):
                     protected.add(j)
-                    break  # Only protect the most recent Read
+                    # Do NOT break — keep scanning for other Read results in the same turn
 
     return protected
 
