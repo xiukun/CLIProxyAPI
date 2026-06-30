@@ -266,6 +266,15 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
     is_codex, codex_system_content = detect_codex(messages, tools)
     codex_instructions = ""
     codex_workspace_ctx = ""
+    # Extract available tool names from the tools array for dynamic prompt building
+    available_tool_names = set()
+    if tools:
+        for tool in tools:
+            if isinstance(tool, dict):
+                func = tool.get("function", tool)
+                name = func.get("name", "")
+                if name:
+                    available_tool_names.add(name)
     if is_codex:
         # Extract workspace context BEFORE compression (compression strips it as noise)
         codex_workspace_ctx = extract_workspace_context(
@@ -331,6 +340,7 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
                 system_prompt = build_codex_system_prompt(
                     codex_instructions, ccg_ctx, lifecycle_context=lifecycle_ctx,
                     workspace_context=codex_workspace_ctx,
+                    available_tools=available_tool_names,
                 )
                 # Ensure .ccg/ scaffold exists so the Codex hook can function
                 if CCG_ENABLED:
@@ -343,6 +353,7 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
                 system_prompt = build_claude_code_system_prompt(
                     claude_code_instructions, ccg_ctx, lifecycle_context=lifecycle_ctx,
                     workspace_context=claude_workspace_ctx,
+                    available_tools=available_tool_names,
                 )
             else:
                 # Non-CLI: use the original cached system prompt

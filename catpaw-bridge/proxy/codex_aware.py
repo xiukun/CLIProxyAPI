@@ -268,7 +268,8 @@ extract_codex_instructions = compress_codex_system_prompt
 
 def build_codex_system_prompt(codex_instructions: str, ccg_context: str = "",
                               lifecycle_context: str = "",
-                              workspace_context: str = "") -> str:
+                              workspace_context: str = "",
+                              available_tools: set = None) -> str:
     """Build a Codex-aware system prompt using incremental merge.
 
     v2 Architecture — Incremental Merge:
@@ -325,10 +326,10 @@ def build_codex_system_prompt(codex_instructions: str, ccg_context: str = "",
         parts.append(build_workspace_anchor(workspace_context))
 
     # Large file editing strategy (critical for edit accuracy)
-    parts.append(_LARGE_FILE_STRATEGY)
+    parts.append(_build_large_file_strategy(available_tools) if available_tools else _build_large_file_strategy(set()))
 
-    # Tool calling format (always present — Bridge supplement)
-    parts.append(_CODEX_TOOL_CALLING)
+    # Tool calling format (always present — Bridge supplement, dynamically built)
+    parts.append(_build_codex_tool_calling(available_tools) if available_tools else _build_codex_tool_calling(set()))
 
     return "\n\n".join(parts)
 
@@ -337,15 +338,40 @@ def build_codex_system_prompt(codex_instructions: str, ccg_context: str = "",
 # Large file editing strategy — prevents edit mismatch from content truncation
 # ---------------------------------------------------------------------------
 
-_LARGE_FILE_STRATEGY = """## Large File Editing Strategy (CRITICAL)
+def _build_large_file_strategy(available_tools: set) -> str:
+    """Build large file editing strategy, using the correct read tool name.
+
+    Args:
+        available_tools: set of tool names the client actually sent
+
+    Returns:
+        Large file editing strategy text
+    """
+    # Determine the read tool name
+    if "read_file" in available_tools:
+        read_tool = "read_file"
+    elif "Read" in available_tools:
+        read_tool = "Read"
+    else:
+        read_tool = "read_file"  # default
+
+    # Determine the edit tool name
+    if "apply_patch" in available_tools:
+        edit_tool = "apply_patch"
+    elif "Edit" in available_tools:
+        edit_tool = "Edit"
+    else:
+        edit_tool = "apply_patch"  # default
+
+    return f"""## Large File Editing Strategy (CRITICAL)
 The proxy bridge may truncate file contents exceeding size limits. To ensure
 your edits apply correctly:
 
 1. For files >500 lines, ALWAYS use offset/limit when reading:
-   read_file(target_file=path, offset=0, limit=200)  — read structure first
-   read_file(target_file=path, offset=N, limit=M)   — then read the section to edit
+   {read_tool}(target_file=path, offset=0, limit=200)  — read structure first
+   {read_tool}(target_file=path, offset=N, limit=M)   — then read the section to edit
 2. Before editing, RE-READ the target section to get fresh, exact content.
-3. Construct apply_patch using ONLY content from your most recent read.
+3. Construct {edit_tool} using ONLY content from your most recent read.
 4. NEVER edit content you haven't read in the current turn — it will fail.
 5. Include 3-5 context lines in patches for reliable matching.
 6. If a file is >2000 lines, never read all at once — always use offset/limit.
@@ -354,28 +380,65 @@ If you see [compacted: N chars omitted] or [lines X-Y omitted] in a Read result,
 that section was truncated. Re-read it with offset/limit before editing."""
 
 
-# Compact tool calling rules adapted for Codex tools
-_CODEX_TOOL_CALLING = """## Tool Calling (CRITICAL)
-When you need to use ANY tool (shell, exec_command, read_file, apply_patch,
-Read, Write, Edit, Bash, etc.), output:
+def _build_codex_tool_calling(available_tools: set) -> str:
+    """Build tool calling rules dynamically, only mentioning available tools.
 
-<tool_call>{"name":"ToolName","arguments":{"param":"value"}}</tool_call>
+    Args:
+        available_tools: set of tool names the client actually sent
+
+    Returns:
+        Tool calling rules text
+    """
+    # Build the tool list string from available tools (ordered by importance)
+    _tool_order = ["shell", "exec_command", "read_file", "apply_patch",
+                   "write_file", "container_exec", "Read", "Write", "Edit",
+                   "Bash", "Grep", "Glob"]
+    mentioned = [t for t in _tool_order if t in available_tools]
+    if not mentioned:
+        mentioned = sorted(available_tools)
+    tool_list = ", ".join(mentioned)
+
+    # Build tool-specific rules based on availability
+    rules = [
+        "- Output ONE tool call at a time, then WAIT for the result.",
+        "- Do NOT output multiple tool calls in one response.",
+        "- Do NOT describe what you will do — just call the tool directly.",
+        "- Do NOT simulate or predict tool results in your output — wait for the actual result.",
+        "- Do NOT include \"Tool Result:\" text in your response — the system provides results.",
+    ]
+    if "read_file" in available_tools or "Read" in available_tools:
+        read_name = "read_file" if "read_file" in available_tools else "Read"
+        rules.append(f"- For {read_name}: always read BEFORE editing.")
+    if "apply_patch" in available_tools:
+        rules.append("- For apply_patch: use the exact format documented above.")
+    rules.append("- Results arrive as 'Tool Result: ...'")
+
+    # Build examples based on available tools
+    examples = []
+    if "shell" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"shell","arguments":{"command":"ls -la"}}</tool_call>')
+    elif "Bash" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"Bash","arguments":{"command":"ls -la","description":"List files"}}</tool_call>')
+    if "read_file" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"read_file","arguments":{"target_file":"./main.py"}}</tool_call>')
+    elif "Read" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"Read","arguments":{"file_path":"./main.py"}}</tool_call>')
+    if "apply_patch" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"apply_patch","arguments":{"patch":"*** Begin Patch\\n*** Update File: main.py\\n ctx\\n-old\\n+new\\n*** End Patch"}}</tool_call>')
+    if not examples:
+        examples.append('- Example: <tool_call>{"name":"ToolName","arguments":{"param":"value"}}</tool_call>')
+
+    return f"""## Tool Calling (CRITICAL)
+When you need to use ANY tool ({tool_list}, etc.), output:
+
+<tool_call>{{"name":"ToolName","arguments":{{"param":"value"}}}}</tool_call>
 
 ### Rules
-- Output ONE tool call at a time, then WAIT for the result.
-- Do NOT output multiple tool calls in one response.
-- Do NOT describe what you will do — just call the tool directly.
-- Do NOT simulate or predict tool results in your output — wait for the actual result.
-- Do NOT include "Tool Result:" text in your response — the system provides results.
-- For read_file/Read: always read BEFORE editing.
-- For apply_patch: use the exact format documented above.
-- Results arrive as 'Tool Result: ...'
+{chr(10).join(rules)}
 
 ### Format Requirements (STRICT)
 - ONLY use <tool_call> tags. Do NOT use any other format.
-- Example: <tool_call>{"name":"shell","arguments":{"command":"ls -la"}}</tool_call>
-- Example: <tool_call>{"name":"read_file","arguments":{"target_file":"./main.py"}}</tool_call>
-- Example: <tool_call>{"name":"apply_patch","arguments":{"patch":"*** Begin Patch\\n*** Update File: main.py\\n ctx\\n-old\\n+new\\n*** End Patch"}}</tool_call>"""
+{chr(10).join(examples)}"""
 
 
 # ---------------------------------------------------------------------------

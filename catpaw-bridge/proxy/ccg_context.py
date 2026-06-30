@@ -108,14 +108,17 @@ def _build_ccg_routing_for_cli(is_codex: bool = False, is_claude_code: bool = Fa
         patch_tool = "apply_patch"
         # Codex can read from ~/.claude/skills/ccg/ via read_file (absolute paths work)
         skill_base = "~/.claude/skills/ccg/domains"
+        tools_base = "~/.claude/skills/ccg/tools"
     elif is_claude_code:
         read_tool = "Read"
         patch_tool = "Write"
         skill_base = "~/.claude/skills/ccg/domains"
+        tools_base = "~/.claude/skills/ccg/tools"
     else:
         read_tool = "read_file"
         patch_tool = "apply_patch"
         skill_base = "~/.claude/skills/ccg/domains"
+        tools_base = "~/.claude/skills/ccg/tools"
 
     lines = [
         "## CCG Skill Routing",
@@ -143,11 +146,13 @@ def _build_ccg_routing_for_cli(is_codex: bool = False, is_claude_code: bool = Fa
     lines.extend([
         "",
         "### Quality Gates (auto-trigger after code changes)",
-        f"- New module created → gen-docs → verify-module → verify-security",
-        f"- Code changes > 30 lines → verify-change → verify-quality",
-        f"- Security-related changes → verify-security",
-        f"- Refactoring → verify-change → verify-quality → verify-security",
+        f"Quality gates are skill FILES you READ with {read_tool}, NOT Skill tool calls.",
+        f"- New module created → Read {tools_base}/gen-docs/SKILL.md → {tools_base}/verify-module/SKILL.md → {tools_base}/verify-security/SKILL.md",
+        f"- Code changes > 30 lines → Read {tools_base}/verify-change/SKILL.md → {tools_base}/verify-quality/SKILL.md",
+        f"- Security-related changes → Read {tools_base}/verify-security/SKILL.md",
+        f"- Refactoring → Read {tools_base}/verify-change/SKILL.md → {tools_base}/verify-quality/SKILL.md → {tools_base}/verify-security/SKILL.md",
         f"- Quality gates are non-blocking unless Critical/High severity found",
+        f"- IMPORTANT: Do NOT use the Skill tool for quality gates. Use {read_tool} to read the SKILL.md file.",
         "",
         "### Routing Rules",
         "1. Keyword match is fuzzy — match on intent, not exact string",

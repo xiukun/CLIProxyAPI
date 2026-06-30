@@ -33,7 +33,7 @@ from proxy.compactor import (
 from proxy.codex_aware import (
     build_codex_system_prompt,
     compress_codex_system_prompt,
-    _LARGE_FILE_STRATEGY,
+    _build_large_file_strategy,
     _APPLY_PATCH_FORMAT,
 )
 from proxy.claude_aware import (
@@ -522,10 +522,11 @@ check("apply_patch: says 3-5", "3-5 context lines" in _APPLY_PATCH_FORMAT)
 check("apply_patch: does NOT say 1-3", "1-3 context lines" not in _APPLY_PATCH_FORMAT)
 
 # Test 8.2: Large file strategy mentions offset/limit
-check("Large file strategy: mentions offset", "offset" in _LARGE_FILE_STRATEGY)
-check("Large file strategy: mentions limit", "limit" in _LARGE_FILE_STRATEGY)
-check("Large file strategy: mentions 500 lines", "500" in _LARGE_FILE_STRATEGY)
-check("Large file strategy: mentions 2000 lines", "2000" in _LARGE_FILE_STRATEGY)
+_large_file_strategy = _build_large_file_strategy({"read_file", "apply_patch"})
+check("Large file strategy: mentions offset", "offset" in _large_file_strategy)
+check("Large file strategy: mentions limit", "limit" in _large_file_strategy)
+check("Large file strategy: mentions 500 lines", "500" in _large_file_strategy)
+check("Large file strategy: mentions 2000 lines", "2000" in _large_file_strategy)
 
 
 # ===========================================================================

@@ -80,7 +80,6 @@ You are an interactive coding agent operating via a proxy bridge.
 - For Edit: use the EXACT text from the Read result as old_string. Match whitespace and indentation PRECISELY (tabs vs spaces matter).
 - For Edit: if old_string appears multiple times, include more surrounding context to make it unique.
 - For Write: provide the COMPLETE file content, not just a fragment or diff.
-- For MultiEdit: provide all edits as a list, each with old_string and new_string. Apply edits top-to-bottom.
 - Do not create files unless absolutely necessary. Prefer editing existing files.
 - After making changes, verify they compile/pass by running appropriate commands.
 
@@ -128,42 +127,66 @@ You are an interactive coding agent operating via a proxy bridge.
 # Critical: without this, the model doesn't know the exact format expectations
 # ---------------------------------------------------------------------------
 
-_CLAUDE_CODE_TOOL_FORMATS = """## Tool Format Reference
-
-### Read
+# Per-tool format documentation fragments — only included when the tool is available
+_CLAUDE_CODE_TOOL_FORMAT_FRAGMENTS = {
+    "Read": """### Read
 - Returns file content with line numbers: `     1|content`
 - Use the exact content (including line numbers) when constructing Edit old_string.
-- Strip the line number prefix when copying text for old_string.
-
-### Edit
+- Strip the line number prefix when copying text for old_string.""",
+    "Edit": """### Edit
 - old_string must match EXACTLY: same whitespace, same indentation, same line endings.
 - If old_string is not unique, include more surrounding context lines.
 - new_string is the replacement text.
-- The edit succeeds silently — no confirmation needed.
-
-### Write
+- The edit succeeds silently — no confirmation needed.""",
+    "Write": """### Write
 - Provide the COMPLETE file content. The entire file is overwritten.
-- Do not use Write for small edits — use Edit instead.
-
-### Bash
+- Do not use Write for small edits — use Edit instead.""",
+    "Bash": """### Bash
 - Always provide a `description` parameter explaining what the command does.
 - Use `run_in_background: true` for long-running commands.
-- The `timeout` parameter is in milliseconds (default 120000 = 2 minutes).
-
-### TodoWrite
+- The `timeout` parameter is in milliseconds (default 120000 = 2 minutes).""",
+    "TodoWrite": """### TodoWrite
 - todos is an array of objects: {id, content, status, activeForm}
 - status values: "pending", "in_progress", "completed"
 - Only ONE todo should be "in_progress" at a time.
-- activeForm describes what you're currently doing (present tense).
-
-### Grep
+- activeForm describes what you're currently doing (present tense).""",
+    "Grep": """### Grep
 - Use `output_mode` to control output: "content" (default), "files_with_matches", "count".
-- `pattern` is a regex by default. Use `-F` in `glob` for fixed strings.
-
-### MultiEdit
+- `pattern` is a regex by default. Use `-F` in `glob` for fixed strings.""",
+    "MultiEdit": """### MultiEdit
 - Apply multiple edits to the same file in one call.
 - Edits are applied top-to-bottom. Each edit is independent.
-- If any edit fails, none are applied (atomic)."""
+- If any edit fails, none are applied (atomic).""",
+    "Glob": """### Glob
+- Returns matching file paths. Use `pattern` for glob expressions.""",
+    "Task": """### Task
+- Spawns a subagent. Provide clear task description and expected output format.""",
+    "WebFetch": """### WebFetch
+- Fetches URL content. Provide `url` and `prompt` for extraction.""",
+    "WebSearch": """### WebSearch
+- Searches the web. Returns results with titles, URLs, and snippets.""",
+}
+
+
+def _build_claude_code_tool_formats(available_tools: set) -> str:
+    """Build tool format reference dynamically, only for available tools.
+
+    Args:
+        available_tools: set of tool names the client actually sent
+
+    Returns:
+        Tool format reference text (only for available tools)
+    """
+    sections = []
+    for name in ["Read", "Edit", "Write", "Bash", "TodoWrite", "Grep", "MultiEdit",
+                 "Glob", "Task", "WebFetch", "WebSearch"]:
+        if name in available_tools:
+            frag = _CLAUDE_CODE_TOOL_FORMAT_FRAGMENTS.get(name)
+            if frag:
+                sections.append(frag)
+    if not sections:
+        return ""
+    return "## Tool Format Reference\n\n" + "\n\n".join(sections)
 
 
 # ---------------------------------------------------------------------------
@@ -336,59 +359,120 @@ def extract_claude_code_instructions(system_content: str) -> str:
 # Large file editing strategy — prevents edit mismatch from content truncation
 # ---------------------------------------------------------------------------
 
-_CLAUDE_LARGE_FILE_STRATEGY = """## Large File Editing Strategy (CRITICAL)
+def _build_claude_large_file_strategy(available_tools: set) -> str:
+    """Build large file editing strategy, using correct tool names.
+
+    Args:
+        available_tools: set of tool names the client actually sent
+
+    Returns:
+        Large file editing strategy text
+    """
+    read_tool = "Read" if "Read" in available_tools else "read_file"
+    edit_tool = "Edit" if "Edit" in available_tools else "apply_patch"
+    read_param = "file_path" if read_tool == "Read" else "target_file"
+
+    return f"""## Large File Editing Strategy (CRITICAL)
 The proxy bridge may truncate file contents exceeding size limits. To ensure
 your edits apply correctly:
 
 1. For files >500 lines, ALWAYS use offset/limit when reading:
-   Read(file_path=path, offset=0, limit=200)  — read structure first
-   Read(file_path=path, offset=N, limit=M)   — then read the section to edit
+   {read_tool}({read_param}=path, offset=0, limit=200)  — read structure first
+   {read_tool}({read_param}=path, offset=N, limit=M)   — then read the section to edit
 2. Before editing, RE-READ the target section to get fresh, exact content.
-3. Construct Edit old_string using ONLY content from your most recent Read.
+3. Construct {edit_tool} old_string using ONLY content from your most recent {read_tool}.
 4. NEVER edit content you haven't read in the current turn — it will fail.
 5. If old_string is not unique, include more surrounding context lines.
 6. If a file is >2000 lines, never read all at once — always use offset/limit.
 
-If you see [compacted: N chars omitted] or [lines X-Y omitted] in a Read result,
+If you see [compacted: N chars omitted] or [lines X-Y omitted] in a {read_tool} result,
 that section was truncated. Re-read it with offset/limit before editing."""
 
 
-# Compact tool calling rules adapted for Claude Code tools
-_CLAUDE_CODE_TOOL_CALLING = """## Tool Calling (CRITICAL)
-When you need to use ANY tool (Bash, Read, Write, Edit, MultiEdit, Grep, Glob,
-TodoWrite, shell, etc.), output:
+def _build_claude_code_tool_calling(available_tools: set) -> str:
+    """Build tool calling rules dynamically, only mentioning available tools.
 
-<tool_call>{"name":"ToolName","arguments":{"param":"value"}}</tool_call>
+    Args:
+        available_tools: set of tool names the client actually sent
+
+    Returns:
+        Tool calling rules text
+    """
+    # Build the tool list string from available tools (ordered by importance)
+    _tool_order = ["Bash", "Read", "Write", "Edit", "MultiEdit", "Grep", "Glob",
+                   "TodoWrite", "Task", "WebFetch", "WebSearch", "shell",
+                   "exec_command", "read_file", "apply_patch"]
+    mentioned = [t for t in _tool_order if t in available_tools]
+    if not mentioned:
+        # Fallback: list all tools the client sent
+        mentioned = sorted(available_tools)
+    tool_list = ", ".join(mentioned)
+
+    # Build tool-specific rules based on availability
+    rules = [
+        "- Output ONE tool call at a time, then WAIT for the result before continuing.",
+        "- Do NOT output multiple tool calls in one response.",
+        "- Do NOT describe what you will do — just call the tool directly.",
+        "- Do NOT use a colon before tool calls. Use a period.",
+        "- Do NOT simulate or predict tool results in your output — wait for the actual result.",
+        "- Do NOT include \"Tool Result:\" text in your response — the system provides results.",
+    ]
+    if "Read" in available_tools or "read_file" in available_tools:
+        read_name = "Read" if "Read" in available_tools else "read_file"
+        rules.append(f"- For {read_name}: always read the file BEFORE editing it.")
+    if "Edit" in available_tools:
+        rules.append("- For Edit: use the EXACT text from the Read result as old_string. Match whitespace precisely.")
+    if "Write" in available_tools or "write_file" in available_tools:
+        write_name = "Write" if "Write" in available_tools else "write_file"
+        rules.append(f"- For {write_name}: provide the COMPLETE file content.")
+    if "Bash" in available_tools or "shell" in available_tools or "exec_command" in available_tools:
+        bash_name = "Bash" if "Bash" in available_tools else ("shell" if "shell" in available_tools else "exec_command")
+        rules.append(f"- For {bash_name}: always include a `description` parameter.")
+    if "TodoWrite" in available_tools or "todo_write" in available_tools:
+        rules.append("- For TodoWrite: use for 3+ step tasks. Only one todo in_progress at a time.")
+    if "MultiEdit" in available_tools:
+        rules.append("- For MultiEdit: provide all edits as a list, each with old_string and new_string. Apply top-to-bottom.")
+    rules.append("- Results arrive as 'Tool Result: ...'")
+
+    # Build examples based on available tools
+    examples = []
+    if "Read" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"Read","arguments":{"file_path":"./main.py"}}</tool_call>')
+    elif "read_file" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"read_file","arguments":{"target_file":"./main.py"}}</tool_call>')
+    if "Edit" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"Edit","arguments":{"file_path":"./main.py","old_string":"old text","new_string":"new text"}}</tool_call>')
+    if "Bash" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"Bash","arguments":{"command":"ls -la","description":"List files in current directory"}}</tool_call>')
+    elif "shell" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"shell","arguments":{"command":"ls -la"}}</tool_call>')
+    if "TodoWrite" in available_tools:
+        examples.append('- Example: <tool_call>{"name":"TodoWrite","arguments":{"todos":[{"id":"1","content":"Fix bug","status":"in_progress","activeForm":"Fixing bug"}]}}</tool_call>')
+    if not examples:
+        # Fallback example
+        examples.append('- Example: <tool_call>{"name":"ToolName","arguments":{"param":"value"}}</tool_call>')
+
+    return f"""## Tool Calling (CRITICAL)
+When you need to use ANY tool ({tool_list}, etc.), output:
+
+<tool_call>{{"name":"ToolName","arguments":{{"param":"value"}}}}</tool_call>
 
 ### Rules
-- Output ONE tool call at a time, then WAIT for the result before continuing.
-- Do NOT output multiple tool calls in one response.
-- Do NOT describe what you will do — just call the tool directly.
-- Do NOT use a colon before tool calls. Use a period.
-- Do NOT simulate or predict tool results in your output — wait for the actual result.
-- Do NOT include "Tool Result:" text in your response — the system provides results.
-- For Read: always Read the file BEFORE editing it.
-- For Edit: use the EXACT text from the Read result as old_string. Match whitespace precisely.
-- For Write: provide the COMPLETE file content.
-- For Bash: always include a `description` parameter.
-- For TodoWrite: use for 3+ step tasks. Only one todo in_progress at a time.
-- Results arrive as 'Tool Result: ...'
+{chr(10).join(rules)}
 
 ### Format Requirements (STRICT)
 - ONLY use <tool_call> tags. Do NOT use any other format.
-- NO: ToolName<parameters>{"key":"value"}</parameters>
+- NO: ToolName<parameters>{{"key":"value"}}</parameters>
 - NO: ToolName(param="value")
 - NO: ```json blocks with tool calls
 - NO: bare JSON without <tool_call> tags
-- Example: <tool_call>{"name":"Read","arguments":{"file_path":"./main.py"}}</tool_call>
-- Example: <tool_call>{"name":"Edit","arguments":{"file_path":"./main.py","old_string":"old text","new_string":"new text"}}</tool_call>
-- Example: <tool_call>{"name":"Bash","arguments":{"command":"ls -la","description":"List files in current directory"}}</tool_call>
-- Example: <tool_call>{"name":"TodoWrite","arguments":{"todos":[{"id":"1","content":"Fix bug","status":"in_progress","activeForm":"Fixing bug"}]}}</tool_call>"""
+{chr(10).join(examples)}"""
 
 
 def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str = "",
                               lifecycle_context: str = "",
-                              workspace_context: str = "") -> str:
+                              workspace_context: str = "",
+                              available_tools: set = None) -> str:
     """Build a Claude Code-aware system prompt using incremental merge.
 
     v2 Architecture — Incremental Merge:
@@ -409,6 +493,8 @@ def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str =
         ccg_context: CCG routing context string (empty if not available)
         lifecycle_context: Phase-aware CCG lifecycle guidance (empty if not applicable)
         workspace_context: Extracted workspace info (cwd, repo layout) for monorepo safety
+        available_tools: Set of tool names the client actually sent (for filtering
+                         tool format references and tool calling rules). None = show all.
 
     Returns:
         Complete system prompt string
@@ -427,7 +513,10 @@ def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str =
         parts.append(_CLAUDE_CODE_BEHAVIORAL_RULES)
 
     # Tool format reference (critical for Claude Code tools)
-    parts.append(_CLAUDE_CODE_TOOL_FORMATS)
+    # Only include format docs for tools that are actually available
+    tool_formats = _build_claude_code_tool_formats(available_tools) if available_tools else ""
+    if tool_formats:
+        parts.append(tool_formats)
 
     # CCG routing rules (if available, CLI-aware)
     if ccg_context:
@@ -443,10 +532,10 @@ def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str =
         parts.append(build_workspace_anchor(workspace_context))
 
     # Large file editing strategy (critical for edit accuracy)
-    parts.append(_CLAUDE_LARGE_FILE_STRATEGY)
+    parts.append(_build_claude_large_file_strategy(available_tools) if available_tools else _build_claude_large_file_strategy(set()))
 
-    # Tool calling format (always present)
-    parts.append(_CLAUDE_CODE_TOOL_CALLING)
+    # Tool calling format (always present, dynamically built)
+    parts.append(_build_claude_code_tool_calling(available_tools) if available_tools else _build_claude_code_tool_calling(set()))
 
     return "\n\n".join(parts)
 
