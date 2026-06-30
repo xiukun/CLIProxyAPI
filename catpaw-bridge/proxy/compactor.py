@@ -211,11 +211,19 @@ def _truncate_tool_result(content: str, tool_name: str, tool_truncation: dict = 
         # so the model knows which lines were omitted and can re-read them.
         if tool_name in ("Read", "read_file"):
             head_lines = head_part.count('\n')
-            total_lines = content.count('\n')
-            tail_first_line = total_lines - tail_part.count('\n') + 1
+            # Calculate the line number where tail_part begins
+            # total_newlines_in_content minus newlines_in_tail gives the
+            # last newline before tail_part; +1 = first line of tail_part
+            total_newlines = content.count('\n')
+            tail_newlines = tail_part.count('\n')
+            tail_first_line = total_newlines - tail_newlines + 1
             omitted_lines = tail_first_line - head_lines - 1
-            marker = (f"\n\n... [lines {head_lines + 1}-{tail_first_line - 1} omitted, "
-                      f"{omitted_lines} lines, {skipped} chars] ...\n\n")
+            if omitted_lines > 0:
+                marker = (f"\n\n... [lines {head_lines + 1}-{tail_first_line - 1} omitted, "
+                          f"{omitted_lines} lines, {skipped} chars] ...\n\n")
+            else:
+                # Omitted section is within a single line (partial line)
+                marker = f"\n\n... [partial line omitted, {skipped} chars] ...\n\n"
         else:
             marker = f"\n\n... [compacted: {skipped} chars omitted] ...\n\n"
 
@@ -228,7 +236,10 @@ def _truncate_tool_result(content: str, tool_name: str, tool_truncation: dict = 
         # For Read/read_file results, include line number range
         if tool_name in ("Read", "read_file"):
             head_lines = head_part.count('\n')
+            # Total lines = newlines + 1 if content doesn't end with newline
             total_lines = content.count('\n')
+            if not content.endswith('\n'):
+                total_lines += 1
             marker = f"\n... [lines {head_lines + 1}-{total_lines} omitted, {skipped} chars] ..."
         else:
             marker = f"\n... [compacted: {skipped} chars omitted] ..."

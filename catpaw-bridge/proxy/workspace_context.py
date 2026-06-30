@@ -22,7 +22,6 @@ How Codex handles this:
 
 import re
 import os
-from proxy.config import VERBOSE
 
 
 # ---------------------------------------------------------------------------
@@ -55,15 +54,11 @@ _RE_CLAUDE_WORKSPACE = re.compile(
 
 # Generic: extract cwd-like paths from text
 _RE_CWD_PATTERN = re.compile(
-    r'(?:cwd|working.?dir|current.?dir|project.?dir|root)[:\s]+([^\n<]+)',
+    r'(?:cwd|working.?dir(?:ectory)?|current.?dir(?:ectory)?|project.?dir|root)[\s:=]+([^\n<]+)',
     re.IGNORECASE
 )
 
-# Generic: extract directory listing patterns (indented tree structure)
-_RE_DIR_TREE = re.compile(
-    r'^([A-Za-z0-9_\-./]+/)\s*$',
-    re.MULTILINE
-)
+# (Directory tree extraction is handled by the repo_layout/env regexes above)
 
 
 def extract_workspace_context(system_content: str, is_codex: bool = False,
@@ -222,7 +217,7 @@ def extract_file_paths_from_tool_call(tool_name: str, arguments: dict) -> list:
         return paths
 
     # Direct file_path parameter (Write, Edit, etc.)
-    for key in ("file_path", "target_file", "path", "filepath"):
+    for key in ("file_path", "target_file", "path", "filepath", "notebook_path"):
         val = arguments.get(key)
         if val and isinstance(val, str):
             paths.append(val)
@@ -261,8 +256,10 @@ def validate_file_paths(paths: list, workspace_root: str = None) -> list:
             workspace_root = None
 
     for path in paths:
-        # Normalize the path
-        clean = path.strip().lstrip("./")
+        # Normalize the path — strip leading "./" but not absolute path slashes
+        clean = path.strip()
+        if clean.startswith("./"):
+            clean = clean[2:]
 
         # Check for absolute paths outside workspace
         if os.path.isabs(clean) and workspace_root:
