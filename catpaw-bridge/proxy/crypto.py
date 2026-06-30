@@ -14,6 +14,7 @@ to force re-extraction on the next encrypt/decrypt call.
 """
 
 import base64
+import os
 import re
 import secrets
 import sys
@@ -47,7 +48,10 @@ def _extract_rsa_keys():
         return result.decode("utf-8")
 
     try:
-        ext_path = "/Applications/CatPawAI.app/Contents/Resources/app/extensions/mt-idekit.mt-idekit-code/out/extension.js"
+        ext_path = os.environ.get(
+            "CATPAW_EXTENSION_JS",
+            "/Applications/CatPawAI.app/Contents/Resources/app/extensions/mt-idekit.mt-idekit-code/out/extension.js",
+        )
         with open(ext_path, "r") as f:
             data = f.read()
 
