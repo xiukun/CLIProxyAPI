@@ -1,0 +1,80 @@
+# =============================================================================
+# 服务器端全链路部署
+# =============================================================================
+# Claude Code → CLIProxyAPI(:40037) → catpaw-bridge(:9000) → catpaw.meituan.com
+#
+# 服务器目录: /userdata/docker/catpaw/
+#
+# 文件上传 (本机同步 token):
+#   curl -T state.vscdb http://server:40036/state.vscdb
+# =============================================================================
+
+services:
+  catpaw-api:
+    image: eceasy/cli-proxy-api:latest
+    container_name: catpaw-api
+    ports:
+      - "0.0.0.0:40037:8317"
+    volumes:
+      - /userdata/docker/catpaw/config.yaml:/CLIProxyAPI/config.yaml:ro
+    depends_on:
+      catpaw-bridge:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - ai-core-net
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  catpaw-bridge:
+    image: cliproxy-catpaw-bridge:latest
+    container_name: catpaw-bridge
+    ports:
+      - "0.0.0.0:40038:9000"
+    environment:
+      CATPAW_PROXY_PORT: "9000"
+      CATPAW_PROXY_HOST: "0.0.0.0"
+      CATPAW_DATA_DIR: /app/auth
+      CATPAW_EXTENSION_JS: /app/keys/extension.js
+      CATPAW_PROXY_VERBOSE: "false"
+    volumes:
+      - /userdata/docker/catpaw/state.vscdb:/app/auth/User/globalStorage/state.vscdb
+      - /userdata/docker/catpaw/extension.js:/app/keys/extension.js:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - ai-core-net
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  catpaw-uploader:
+    image: python:3.11-slim
+    container_name: catpaw-uploader
+    ports:
+      - "0.0.0.0:40036:9100"
+    volumes:
+      - /userdata/docker/catpaw/state.vscdb:/data/auth/state.vscdb
+      - /userdata/docker/catpaw/upload-server.py:/app/upload-server.py:ro
+    command: ["python3", "/app/upload-server.py"]
+    environment:
+      UPLOAD_PORT: "9100"
+    restart: unless-stopped
+    networks:
+      - ai-core-net
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+networks:
+  ai-core-net:
+    external: true
+    name: ai-network
