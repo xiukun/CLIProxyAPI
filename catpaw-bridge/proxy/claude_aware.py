@@ -332,6 +332,27 @@ def extract_claude_code_instructions(system_content: str) -> str:
 # Claude Code-aware system prompt builder
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Large file editing strategy — prevents edit mismatch from content truncation
+# ---------------------------------------------------------------------------
+
+_CLAUDE_LARGE_FILE_STRATEGY = """## Large File Editing Strategy (CRITICAL)
+The proxy bridge may truncate file contents exceeding size limits. To ensure
+your edits apply correctly:
+
+1. For files >500 lines, ALWAYS use offset/limit when reading:
+   Read(file_path=path, offset=0, limit=200)  — read structure first
+   Read(file_path=path, offset=N, limit=M)   — then read the section to edit
+2. Before editing, RE-READ the target section to get fresh, exact content.
+3. Construct Edit old_string using ONLY content from your most recent Read.
+4. NEVER edit content you haven't read in the current turn — it will fail.
+5. If old_string is not unique, include more surrounding context lines.
+6. If a file is >2000 lines, never read all at once — always use offset/limit.
+
+If you see [compacted: N chars omitted] or [lines X-Y omitted] in a Read result,
+that section was truncated. Re-read it with offset/limit before editing."""
+
+
 # Compact tool calling rules adapted for Claude Code tools
 _CLAUDE_CODE_TOOL_CALLING = """## Tool Calling (CRITICAL)
 When you need to use ANY tool (Bash, Read, Write, Edit, MultiEdit, Grep, Glob,
@@ -366,7 +387,8 @@ TodoWrite, shell, etc.), output:
 
 
 def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str = "",
-                              lifecycle_context: str = "") -> str:
+                              lifecycle_context: str = "",
+                              workspace_context: str = "") -> str:
     """Build a Claude Code-aware system prompt using incremental merge.
 
     v2 Architecture — Incremental Merge:
@@ -376,14 +398,17 @@ def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str =
       3. Tool format reference (Edit exact match, Read line numbers, etc.)
       4. CCG routing rules (if available, CLI-aware)
       5. CCG lifecycle guidance (phase-aware, from conversation analysis)
-      6. Tool calling format
+      6. Workspace context + boundary rules (monorepo safety)
+      7. Large file editing strategy (critical for edit accuracy)
+      8. Tool calling format
 
-    Total size: ~6-9KB (original prompt compressed + supplements)
+    Total size: ~7-11KB (original prompt compressed + supplements)
 
     Args:
         claude_instructions: Compressed Claude Code system prompt
         ccg_context: CCG routing context string (empty if not available)
         lifecycle_context: Phase-aware CCG lifecycle guidance (empty if not applicable)
+        workspace_context: Extracted workspace info (cwd, repo layout) for monorepo safety
 
     Returns:
         Complete system prompt string
@@ -411,6 +436,14 @@ def build_claude_code_system_prompt(claude_instructions: str, ccg_context: str =
     # CCG lifecycle guidance (phase-aware, dynamic)
     if lifecycle_context:
         parts.append(lifecycle_context)
+
+    # Workspace context + boundary rules (monorepo safety — survives compaction)
+    if workspace_context:
+        from proxy.workspace_context import build_workspace_anchor
+        parts.append(build_workspace_anchor(workspace_context))
+
+    # Large file editing strategy (critical for edit accuracy)
+    parts.append(_CLAUDE_LARGE_FILE_STRATEGY)
 
     # Tool calling format (always present)
     parts.append(_CLAUDE_CODE_TOOL_CALLING)

@@ -52,6 +52,7 @@ from proxy.ccg_lifecycle import (
     ensure_ccg_scaffold,
     create_ccg_task,
 )
+from proxy.workspace_context import extract_workspace_context
 
 
 # ---------------------------------------------------------------------------
@@ -264,19 +265,33 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
     # ------------------------------------------------------------------
     is_codex, codex_system_content = detect_codex(messages, tools)
     codex_instructions = ""
+    codex_workspace_ctx = ""
     if is_codex:
+        # Extract workspace context BEFORE compression (compression strips it as noise)
+        codex_workspace_ctx = extract_workspace_context(
+            codex_system_content, is_codex=True, is_claude_code=False
+        )
         codex_instructions = compress_codex_system_prompt(codex_system_content)
         if VERBOSE:
             print(f"[CatPawProxy] Codex mode: compressed system prompt to {len(codex_instructions)} chars", flush=True)
+            if codex_workspace_ctx:
+                print(f"[CatPawProxy] Codex mode: extracted workspace context ({len(codex_workspace_ctx)} chars)", flush=True)
 
     is_claude_code = False
     claude_code_instructions = ""
+    claude_workspace_ctx = ""
     if not is_codex:
         is_claude_code, claude_code_system_content = detect_claude_code(messages, tools)
         if is_claude_code:
+            # Extract workspace context BEFORE compression
+            claude_workspace_ctx = extract_workspace_context(
+                claude_code_system_content, is_codex=False, is_claude_code=True
+            )
             claude_code_instructions = extract_claude_code_instructions(claude_code_system_content)
             if VERBOSE:
                 print(f"[CatPawProxy] Claude Code mode: extracted {len(claude_code_instructions)} chars of behavioral instructions", flush=True)
+                if claude_workspace_ctx:
+                    print(f"[CatPawProxy] Claude Code mode: extracted workspace context ({len(claude_workspace_ctx)} chars)", flush=True)
 
     # Log individual message sizes for debugging
     if VERBOSE and messages:
@@ -314,7 +329,8 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
                 ccg_ctx = _get_ccg_routing_for_cli(is_codex=True, is_claude_code=False) if CCG_ENABLED else ""
                 lifecycle_ctx = get_ccg_lifecycle_context(messages, is_codex=True) if CCG_ENABLED else ""
                 system_prompt = build_codex_system_prompt(
-                    codex_instructions, ccg_ctx, lifecycle_context=lifecycle_ctx
+                    codex_instructions, ccg_ctx, lifecycle_context=lifecycle_ctx,
+                    workspace_context=codex_workspace_ctx,
                 )
                 # Ensure .ccg/ scaffold exists so the Codex hook can function
                 if CCG_ENABLED:
@@ -325,7 +341,8 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
                 ccg_ctx = _get_ccg_routing_for_cli(is_codex=False, is_claude_code=True) if CCG_ENABLED else ""
                 lifecycle_ctx = get_ccg_lifecycle_context(messages, is_claude_code=True) if CCG_ENABLED else ""
                 system_prompt = build_claude_code_system_prompt(
-                    claude_code_instructions, ccg_ctx, lifecycle_context=lifecycle_ctx
+                    claude_code_instructions, ccg_ctx, lifecycle_context=lifecycle_ctx,
+                    workspace_context=claude_workspace_ctx,
                 )
             else:
                 # Non-CLI: use the original cached system prompt

@@ -118,7 +118,7 @@ Use apply_patch tool for file changes. The patch text uses this format:
 
 Rules:
 - Each + line is added, - line is removed, space-prefixed line is context.
-- Include 1-3 context lines around changes for matching.
+- Include 3-5 context lines around changes for matching.
 - For multiple files, use separate *** Begin/End Patch blocks.
 - For move/rename: delete old file + add new file."""
 
@@ -267,7 +267,8 @@ extract_codex_instructions = compress_codex_system_prompt
 # ---------------------------------------------------------------------------
 
 def build_codex_system_prompt(codex_instructions: str, ccg_context: str = "",
-                              lifecycle_context: str = "") -> str:
+                              lifecycle_context: str = "",
+                              workspace_context: str = "") -> str:
     """Build a Codex-aware system prompt using incremental merge.
 
     v2 Architecture — Incremental Merge:
@@ -277,14 +278,17 @@ def build_codex_system_prompt(codex_instructions: str, ccg_context: str = "",
       3. apply_patch format documentation (Bridge supplement)
       4. CCG routing rules (if available, CLI-aware)
       5. CCG lifecycle guidance (phase-aware, from conversation analysis)
-      6. Tool calling format (Bridge supplement)
+      6. Workspace context + boundary rules (monorepo safety)
+      7. Large file editing strategy (critical for edit accuracy)
+      8. Tool calling format (Bridge supplement)
 
-    Total size: ~5-8KB (original prompt compressed + supplements)
+    Total size: ~6-10KB (original prompt compressed + supplements)
 
     Args:
         codex_instructions: Compressed Codex system prompt (from compress_codex_system_prompt)
         ccg_context: CCG routing context string (empty if not available)
         lifecycle_context: Phase-aware CCG lifecycle guidance (empty if not applicable)
+        workspace_context: Extracted workspace info (cwd, repo layout) for monorepo safety
 
     Returns:
         Complete system prompt string
@@ -315,10 +319,39 @@ def build_codex_system_prompt(codex_instructions: str, ccg_context: str = "",
     if lifecycle_context:
         parts.append(lifecycle_context)
 
+    # Workspace context + boundary rules (monorepo safety — survives compaction)
+    if workspace_context:
+        from proxy.workspace_context import build_workspace_anchor
+        parts.append(build_workspace_anchor(workspace_context))
+
+    # Large file editing strategy (critical for edit accuracy)
+    parts.append(_LARGE_FILE_STRATEGY)
+
     # Tool calling format (always present — Bridge supplement)
     parts.append(_CODEX_TOOL_CALLING)
 
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Large file editing strategy — prevents edit mismatch from content truncation
+# ---------------------------------------------------------------------------
+
+_LARGE_FILE_STRATEGY = """## Large File Editing Strategy (CRITICAL)
+The proxy bridge may truncate file contents exceeding size limits. To ensure
+your edits apply correctly:
+
+1. For files >500 lines, ALWAYS use offset/limit when reading:
+   read_file(target_file=path, offset=0, limit=200)  — read structure first
+   read_file(target_file=path, offset=N, limit=M)   — then read the section to edit
+2. Before editing, RE-READ the target section to get fresh, exact content.
+3. Construct apply_patch using ONLY content from your most recent read.
+4. NEVER edit content you haven't read in the current turn — it will fail.
+5. Include 3-5 context lines in patches for reliable matching.
+6. If a file is >2000 lines, never read all at once — always use offset/limit.
+
+If you see [compacted: N chars omitted] or [lines X-Y omitted] in a Read result,
+that section was truncated. Re-read it with offset/limit before editing."""
 
 
 # Compact tool calling rules adapted for Codex tools
