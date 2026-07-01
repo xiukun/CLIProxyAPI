@@ -31,7 +31,10 @@ async def get_session() -> aiohttp.ClientSession:
     """Get or create the global aiohttp ClientSession."""
     global _global_session
     if _global_session is None or _global_session.closed:
-        timeout = aiohttp.ClientTimeout(total=600, connect=15, sock_read=120)
+        # sock_read=300s: CatPawAI may need up to 5 min to start streaming
+        # for large requests (100KB+). total=900s allows for long streaming
+        # responses after the initial connection is established.
+        timeout = aiohttp.ClientTimeout(total=900, connect=15, sock_read=300)
         connector = aiohttp.TCPConnector(
             limit=20,           # max concurrent connections
             limit_per_host=10,  # max per host
@@ -224,6 +227,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     # request. This avoids DNS lookup + TLS handshake overhead (~200ms saved
     # per request) and enables HTTP keep-alive connection reuse.
     prepared_stream = None
+    partial_content = ""  # Track partial content for error recovery
 
     try:
         session = await get_session()
@@ -346,6 +350,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
                             content = _extract_content_from_catpaw(catpaw_data)
                             if content:
                                 last_content = content
+                                partial_content = content  # Track for error recovery
                             await _send_keepalive(keepalive_stream, last_keepalive)
 
                         full_content = last_content
@@ -522,27 +527,151 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             if prepared_stream is not None:
                 return prepared_stream
             return web.Response(status=499)  # Client Closed Request
-        print(f"[CatPawProxy] Upstream error: {type(e).__name__}: {e}", flush=True, file=sys.stderr)
+
+        # Classify error type for logging and client feedback
+        is_timeout = "Timeout" in type(e).__name__
+        is_transfer_error = "Transfer" in type(e).__name__ or "Payload" in type(e).__name__
+        if is_timeout:
+            error_label = "Upstream timeout"
+        elif is_transfer_error:
+            error_label = "Upstream connection interrupted"
+        else:
+            error_label = f"Upstream error: {type(e).__name__}"
+        print(f"[CatPawProxy] {error_label}: {e}", flush=True, file=sys.stderr)
         import traceback
         traceback.print_exc(file=sys.stderr)
+
+        # --- Error recovery: try to use partial content ---
+        # When the upstream connection drops mid-stream, we may have received
+        # partial (but valid) model output. Try to parse and return it instead
+        # of discarding it. This is especially valuable for tool calls — the
+        # model often finishes the tool call JSON before the trailing SSE
+        # signals arrive, so the partial content may contain a complete call.
+        if partial_content:
+            pc = partial_content.replace("\x00", "")
+            pc = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', pc)
+
+            if has_tools:
+                clean_text, tool_calls = _parse_tool_calls(pc)
+                if tool_calls:
+                    # Found complete tool calls in partial content!
+                    if VERBOSE:
+                        print(f"[CatPawProxy] Recovered {len(tool_calls)} tool call(s) from partial content after {error_label}", flush=True)
+                    if prepared_stream is not None:
+                        try:
+                            resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+                            resp_created = int(time.time())
+                            if clean_text:
+                                text_chunk = {
+                                    "id": resp_id, "object": "chat.completion.chunk",
+                                    "created": resp_created, "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": clean_text}, "finish_reason": None}],
+                                }
+                                await prepared_stream.write(f"data: {json.dumps(text_chunk, ensure_ascii=False)}\n\n".encode())
+                            for i, tc in enumerate(tool_calls):
+                                tc_chunk = {
+                                    "id": resp_id, "object": "chat.completion.chunk",
+                                    "created": resp_created, "model": model,
+                                    "choices": [{"index": 0, "delta": {"tool_calls": [{
+                                        "index": i, "id": tc["id"], "type": "function",
+                                        "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
+                                    }]}, "finish_reason": None}],
+                                }
+                                await prepared_stream.write(f"data: {json.dumps(tc_chunk, ensure_ascii=False)}\n\n".encode())
+                            final_chunk = {
+                                "id": resp_id, "object": "chat.completion.chunk",
+                                "created": resp_created, "model": model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                            }
+                            await prepared_stream.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
+                            await prepared_stream.write(b"data: [DONE]\n\n")
+                            await prepared_stream.write_eof()
+                        except Exception:
+                            pass
+                        return prepared_stream
+                    else:
+                        message = {"role": "assistant", "content": clean_text if clean_text else None}
+                        message["tool_calls"] = tool_calls
+                        return web.json_response({
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                            "object": "chat.completion", "created": int(time.time()), "model": model,
+                            "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
+                            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                        })
+                # No tool calls found in partial content, return as text
+                display_text = clean_text if clean_text else pc
+            else:
+                display_text = pc
+
+            if VERBOSE:
+                print(f"[CatPawProxy] Returning partial content ({len(display_text)} chars) after {error_label}", flush=True)
+
+            if prepared_stream is not None:
+                # Buffer mode (has_tools, stream): keepalive_stream was prepared
+                # but NO actual content was sent yet — only keepalive comments.
+                # We must send display_text as content before closing.
+                # Stream mode (no tools): content was already streamed to client,
+                # so just close gracefully.
+                try:
+                    resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+                    resp_created = int(time.time())
+                    if has_tools and display_text:
+                        text_chunk = {
+                            "id": resp_id, "object": "chat.completion.chunk",
+                            "created": resp_created, "model": model,
+                            "choices": [{"index": 0, "delta": {"content": display_text}, "finish_reason": None}],
+                        }
+                        await prepared_stream.write(f"data: {json.dumps(text_chunk, ensure_ascii=False)}\n\n".encode())
+                    final_chunk = {
+                        "id": resp_id, "object": "chat.completion.chunk",
+                        "created": resp_created, "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    await prepared_stream.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
+                    await prepared_stream.write(b"data: [DONE]\n\n")
+                    await prepared_stream.write_eof()
+                except Exception:
+                    pass
+                return prepared_stream
+            else:
+                return web.json_response({
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                    "object": "chat.completion", "created": int(time.time()), "model": model,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": display_text}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                })
+
+        # --- No partial content: send concise error ---
         if prepared_stream is not None:
             try:
-                error_chunk = {
-                    "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
+                resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+                resp_created = int(time.time())
+                # Only send error text as content in buffer mode (has_tools),
+                # where the client hasn't received any content yet.
+                # In stream mode (no tools), content was already streamed —
+                # appending an error message would be mistaken for model output.
+                if has_tools:
+                    error_msg = "[proxy: upstream connection interrupted, please retry]"
+                    error_chunk = {
+                        "id": resp_id, "object": "chat.completion.chunk",
+                        "created": resp_created, "model": model,
+                        "choices": [{"index": 0, "delta": {"content": error_msg}, "finish_reason": None}],
+                    }
+                    await prepared_stream.write(f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode())
+                final_chunk = {
+                    "id": resp_id, "object": "chat.completion.chunk",
+                    "created": resp_created, "model": model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
-                await prepared_stream.write(f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode())
+                await prepared_stream.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
                 await prepared_stream.write(b"data: [DONE]\n\n")
                 await prepared_stream.write_eof()
             except Exception:
                 pass
             return prepared_stream
         return web.json_response(
-            {"error": {"message": f"Upstream error: {e}", "type": "upstream_error"}},
-            status=502,
+            {"error": {"message": error_label, "type": "timeout_error" if is_timeout else "upstream_error"}},
+            status=504 if is_timeout else 502,
         )
     except ConnectionResetError as e:
         # Python builtin ConnectionResetError (different from aiohttp's)
@@ -551,17 +680,18 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             return prepared_stream
         return web.Response(status=499)
     except asyncio.TimeoutError:
-        print(f"[CatPawProxy] Upstream timeout", flush=True, file=sys.stderr)
+        # Safety net: SocketTimeoutError is already caught by aiohttp.ClientError
+        # above (it inherits from both). This handles pure asyncio.TimeoutError
+        # from other sources (e.g. asyncio.wait_for) if ever added.
+        print(f"[CatPawProxy] Asyncio timeout", flush=True, file=sys.stderr)
         if prepared_stream is not None:
             try:
-                error_chunk = {
+                final_chunk = {
                     "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
+                    "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
-                await prepared_stream.write(f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode())
+                await prepared_stream.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
                 await prepared_stream.write(b"data: [DONE]\n\n")
                 await prepared_stream.write_eof()
             except Exception:
