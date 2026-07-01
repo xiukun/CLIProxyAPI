@@ -64,6 +64,15 @@ _RE_NAME_JSON_HEAD = re.compile(r'^(\w[\w.\-]*)\s*(\{.*)', re.DOTALL)
 # omitted the opening {"name":" prefix. Result: ToolName","arguments":{...}}
 _RE_TRUNCATED_JSON = re.compile(r'^(\w[\w.\-]*)","arguments"\s*:\s*(.*)', re.DOTALL)
 
+# Format 9b: <tool_call>{"ToolName","arguments":{"key":"value"}}</tool_call>
+# Missing "name" key: model outputs {"update_plan","arguments":{...}}
+# instead of {"name":"update_plan","arguments":{...}}.
+# The first value is a bare string (tool name) followed by ,"arguments":
+_RE_MISSING_NAME_KEY = re.compile(
+    r'^\s*\{\s*"([\w.\-]+)"\s*,\s*"arguments"\s*:',
+    re.DOTALL
+)
+
 # Format 10: ToolName<parameters>{...}</parameters>
 # The model (glm-5.2) sometimes outputs this format instead of <tool_call> tags:
 #   exec_command<parameters>{"cmd":"git status","workdir":"/path"}</parameters>
@@ -546,6 +555,25 @@ def _regex_extract_tool_call(text: str) -> dict | None:
     }
 
 
+def _fix_missing_name_key(json_str: str) -> str:
+    """Fix JSON where the "name" key is missing.
+
+    The model (glm-5.2) sometimes outputs:
+        {"update_plan","arguments":{"explanation":"...","plan":[...]}}
+    instead of:
+        {"name":"update_plan","arguments":{"explanation":"...","plan":[...]}}
+
+    This detects the pattern {"ToolName","arguments": and inserts the
+    missing "name": key so that standard JSON parsing can proceed.
+    """
+    m = _RE_MISSING_NAME_KEY.match(json_str)
+    if m:
+        tool_name = m.group(1)
+        rest = json_str[m.end():]
+        return '{"name":"' + tool_name + '","arguments":' + rest
+    return json_str
+
+
 def _extract_tool_call(json_str: str) -> dict | None:
     """Extract a single tool call from JSON string.
 
@@ -554,6 +582,10 @@ def _extract_tool_call(json_str: str) -> dict | None:
     This prevents _clean_json_string from corrupting valid JSON that
     happens to contain patterns like " : " inside string values.
     """
+    # Preprocessing: Fix missing "name" key
+    # (e.g. {"update_plan","arguments": → {"name":"update_plan","arguments":)
+    json_str = _fix_missing_name_key(json_str)
+
     # Strategy 1: Try parsing as-is (handles well-formed JSON)
     try:
         data = json.loads(json_str)
