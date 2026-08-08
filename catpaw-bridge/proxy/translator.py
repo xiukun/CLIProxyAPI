@@ -101,6 +101,20 @@ def _strip_system_reminders(content: str) -> str:
     return _RE_SYSTEM_REMINDER.sub('', content).strip()
 
 
+def _strip_system_reminder_tags(content: str) -> str:
+    """Remove <system-reminder> wrapper tags but KEEP the inner content.
+
+    For non-CLI clients (like ZCode), system-reminders contain actual task
+    instructions (e.g. "Continue working toward the active session goal.
+    首先调用 Skill 工具..."). Dropping these messages entirely causes the
+    model to lose context and enter infinite loops.
+
+    This function removes only the XML tags, preserving the instructions.
+    """
+    content = re.sub(r'</?system-reminder>', '', content)
+    return content.strip()
+
+
 def _smart_truncate(content: str, limit: int) -> str:
     """Truncate content keeping both beginning and end.
 
@@ -190,8 +204,15 @@ def _filter_messages(messages: list, has_tools: bool, is_codex: bool = False, is
                 stripped, useful_ctx = extract_useful_reminder_context(content)
                 if useful_ctx:
                     useful_reminder_context.append(useful_ctx)
-            else:
+            elif is_codex:
+                # Codex mode: strip entirely (same as before)
                 stripped = _strip_system_reminders(content)
+            else:
+                # Non-CLI clients (ZCode, etc.): system-reminders contain
+                # actual task instructions. Remove tags but KEEP content.
+                # Dropping these messages causes infinite loops because the
+                # model loses its task instructions.
+                stripped = _strip_system_reminder_tags(content)
 
             if stripped:
                 # There's real content after stripping — keep it
@@ -356,8 +377,18 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
                     available_tools=available_tool_names,
                 )
             else:
-                # Non-CLI: use the original cached system prompt
-                system_prompt = _CUSTOM_SYSTEM_PROMPT
+                # Non-CLI (ZCode, etc.): DON'T inject _CUSTOM_SYSTEM_PROMPT
+                # because it overrides the client's identity (e.g. "You are
+                # ZCode"). Instead, use a minimal prompt that only adds tool
+                # calling format rules, letting the client's own system prompt
+                # (from user messages) define the agent's identity and behavior.
+                system_prompt = (
+                    "Follow the user's instructions carefully.\n"
+                    "Communicate in the user's language, keep technical terms in English.\n\n"
+                    "## Tool Calling\n"
+                    "When you need to use ANY tool, output the tool call in JSON format inside <tool_call XML tags.\n"
+                    "Output ONE tool call at a time, then WAIT for the result.\n"
+                )
 
             parts = [system_prompt]
             tools_prompt = ""
@@ -487,6 +518,32 @@ async def openai_to_catpaw_request(openai_body: dict) -> dict:
         # Append prompt for assistant if last message is from user
         if messages and messages[-1].get("role") == "user":
             merged_content += "\n\nAssistant:"
+
+        # --- Loop detection ---
+        # If the last 3+ assistant responses are identical (or near-identical),
+        # the model is stuck in a loop. Inject a correction to break the pattern.
+        # This commonly happens when CatPawAI's backend overrides the client's
+        # identity (e.g. model says "我是 CatPaw" instead of following instructions).
+        assistant_responses = [
+            _extract_text_content(msg.get("content", ""))
+            for msg in messages
+            if msg.get("role") == "assistant"
+        ]
+        if len(assistant_responses) >= 3:
+            # Check if last 3 responses are very similar (>80% identical prefix)
+            last_3 = assistant_responses[-3:]
+            prefix_len = min(100, len(last_3[0]), len(last_3[1]), len(last_3[2]))
+            if prefix_len > 20 and last_3[0][:prefix_len] == last_3[1][:prefix_len] == last_3[2][:prefix_len]:
+                if VERBOSE:
+                    print(f"[CatPawProxy] Loop detected: last 3 assistant responses are identical", flush=True)
+                # Inject correction: replace the loop-causing history with a
+                # concise note and re-emphasize the current task
+                loop_warning = (
+                    "\n\n[SYSTEM NOTE: The previous responses were repetitive and did not follow "
+                    "instructions. Please re-read the user's request carefully and provide a "
+                    "direct, specific response. Do NOT introduce yourself again.]"
+                )
+                merged_content += loop_warning
 
     catpaw_msg = {
         "role": "user",
